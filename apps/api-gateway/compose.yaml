@@ -1,0 +1,14 @@
+version: "3"
+services:
+  app:
+    read_only: true
+    build:
+      platforms:
+        - linux/amd64
+      context: .
+    ports:
+      - 3000:3000
+    # running using docker-compose is not recommended
+    # if you want to do so, you will need to provide the necessary environment variables
+    # environment:
+    #   ...

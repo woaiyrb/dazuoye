@@ -1,0 +1,694 @@
+import {
+  getLanguageCode,
+  getLanguageName,
+} from "@/app/Helpers/getLanguageName";
+import MarkdownViewer from "@/components/MarkdownViewer";
+import { QuestionDisplayType, QuestionStore, Scoring } from "@/config/types";
+import { cn } from "@/lib/strings";
+import { isInteractiveTarget } from "@/lib/utils";
+import { translateQuestion } from "@/lib/talkToBackend";
+import languages from "@/public/languages.json";
+import {
+  useAssignmentDetails,
+  useLearnerOverviewStore,
+  useLearnerStore,
+} from "@/stores/learner";
+import {
+  ArrowLongLeftIcon,
+  ArrowLongRightIcon,
+  ClockIcon,
+  ExclamationTriangleIcon,
+  LanguageIcon,
+  TagIcon as OutlineTagIcon,
+  ArrowRightIcon,
+  PaperAirplaneIcon,
+} from "@heroicons/react/24/outline";
+import { TagIcon } from "@heroicons/react/24/solid";
+import { useSearchParams } from "next/navigation";
+import { ComponentPropsWithoutRef, useEffect, useState } from "react";
+import RenderQuestion from "./RenderQuestion";
+import ShowHideRubric from "./ShowHideRubric";
+
+// Same wording the header's Submit tooltip uses for this state.
+const UPLOAD_IN_PROGRESS_TOOLTIP = "File upload in progress...";
+
+const TRANSLATION_PREVIEW_DISABLED_TOOLTIP =
+  "Translations are only available after publishing this assignment. Publish to preview translated content.";
+
+interface Props extends ComponentPropsWithoutRef<"section"> {
+  question: QuestionStore;
+  questionNumber: number;
+  questionId: number;
+  questionDisplay: QuestionDisplayType;
+  lastQuestionNumber: number;
+}
+
+function Component(props: Props) {
+  const {
+    className,
+    questionId,
+    questionNumber,
+    question,
+    questionDisplay,
+    lastQuestionNumber,
+  } = props;
+  const assignmentDetails = useAssignmentDetails(
+    (state) => state.assignmentDetails,
+  );
+  const optionalQuestionIds = assignmentDetails?.optionalQuestionIds ?? [];
+  const requiredQuestion =
+    assignmentDetails?.requireAllQuestions &&
+    !optionalQuestionIds.includes(questionId);
+  const questionControls = assignmentDetails?.questionControls;
+  const assignmentId = useLearnerOverviewStore((state) => state.assignmentId);
+  const [activeQuestionNumber, setActiveQuestionNumber] = useLearnerStore(
+    (state) => [state.activeQuestionNumber, state.setActiveQuestionNumber],
+  );
+
+  // author comment visiblity
+  const role = useLearnerStore((state) => state.role);
+  const isAuthorView = role === "author";
+
+  // The header owns the full submit gate; this button only needs the one
+  // condition a learner can plausibly race, and subscribing to a boolean keeps
+  // every question on the page from re-rendering as answers are typed.
+  const isUploadingFiles = useLearnerStore((state) => state.isUploadingFiles);
+
+  const setQuestionStatus = useLearnerStore((state) => state.setQuestionStatus);
+  const getQuestionStatusById = useLearnerStore(
+    (state) => state.getQuestionStatusById,
+  );
+  const setSelectedLanguage = useLearnerStore(
+    (state) => state.setSelectedLanguage,
+  );
+  useEffect(() => {
+    if (typeof question.scoring === "string") {
+      question.scoring = JSON.parse(question.scoring) as Scoring;
+    }
+  }, [question.scoring]);
+  const checkToShowRubric = () => {
+    if (
+      ["TEXT", "UPLOAD", "LINk_FILE", "URL"].includes(question.type) &&
+      question.scoring.showSubQuestionsToLearner &&
+      question.scoring?.rubrics
+    )
+      return true;
+    else return false;
+  };
+  const showRubrics = question.scoring?.showRubricsToLearner ?? false;
+  const showPoints = question.scoring?.showPoints ?? false;
+
+  const questionStatus = getQuestionStatusById
+    ? getQuestionStatusById(questionId)
+    : "unedited";
+
+  let questionTypeText: string;
+  if (question.type === "MULTIPLE_CORRECT") {
+    questionTypeText = "MULTIPLE SELECT";
+  } else if (question.type === "SINGLE_CORRECT") {
+    questionTypeText = "MULTIPLE CHOICE";
+  } else if (question.type === "TRUE_FALSE") {
+    questionTypeText = "TRUE OR FALSE";
+  } else {
+    questionTypeText = question.type;
+  }
+
+  const searchParams = useSearchParams();
+  const isAuthorPreview = searchParams.get("authorMode") === "true";
+
+  const handleFlaggingQuestion = () => {
+    if (questionStatus === "flagged") {
+      setQuestionStatus(questionId, "unflagged");
+    } else {
+      setQuestionStatus(questionId, "flagged");
+    }
+  };
+  const translationOn = useLearnerStore((state) =>
+    state.getTranslationOn(questionId),
+  );
+  const setTranslatedQuestion = useLearnerStore(
+    (state) => state.setTranslatedQuestion,
+  );
+  const setTranslatedChoices = useLearnerStore(
+    (state) => state.setTranslatedChoices,
+  );
+  const [userPreferedLanguage] = useLearnerStore((state) => [
+    state.userPreferedLanguage,
+    state.setUserPreferedLanguage,
+  ]);
+  const [userPreferedLanguageName, setUserPreferredLanguageName] = useState<
+    string | undefined
+  >(undefined);
+  (useEffect(() => {
+    if (userPreferedLanguage) {
+      setUserPreferredLanguageName(
+        getLanguageName(userPreferedLanguage) || "English",
+      );
+    }
+  }),
+    [userPreferedLanguage]);
+  const translatingWords = [
+    "Translating",
+    "Traduciendo",
+    "Traduction",
+    "Traduzione",
+    "Übersetzen",
+    "Tradução",
+    "번역 중",
+    "翻訳中",
+    "ترجمة",
+  ];
+
+  const setTranslationOn = useLearnerStore((state) => state.setTranslationOn);
+  const effectiveTranslationOn = translationOn && !isAuthorPreview;
+  const toggleTranslation = () => {
+    if (isAuthorPreview) return;
+    setTranslationOn(questionId, !translationOn);
+
+    if (
+      !translationOn &&
+      question.selectedLanguage !== userPreferedLanguageName
+    ) {
+      void fetchTranslation();
+    }
+  };
+
+  const [globalLanguage, setGlobalLanguage] = useLearnerStore((state) => [
+    state.globalLanguage,
+    state.setGlobalLanguage,
+  ]);
+  const [loadingTranslation, setLoadingTranslation] = useState(false);
+  const [currentWord, setCurrentWord] = useState(translatingWords[0]);
+
+  useEffect(() => {
+    if (!loadingTranslation) return;
+
+    let index = 0;
+    const interval = setInterval(() => {
+      index = (index + 1) % translatingWords.length;
+      setCurrentWord(translatingWords[index]);
+    }, 1200);
+
+    return () => clearInterval(interval);
+  }, [loadingTranslation]);
+  const fetchTranslation = async () => {
+    if (assignmentId == null || questionId == null) {
+      return;
+    }
+    try {
+      setLoadingTranslation(true);
+      const translation = await translateQuestion(
+        assignmentId,
+        questionId,
+        question,
+        question.selectedLanguage,
+        languages.find((lang) => lang.name === question.selectedLanguage)
+          ?.code || "en",
+      );
+
+      setTranslatedQuestion(questionId, translation.translatedQuestion);
+      if (translation.translatedChoices) {
+        const choiceTexts = translation.translatedChoices.map((choice) =>
+          typeof choice === "string"
+            ? choice
+            : choice?.choice || String(choice),
+        );
+        setTranslatedChoices(questionId, choiceTexts);
+      }
+    } catch (error) {
+      console.error("Error fetching translation:", error);
+    } finally {
+      setLoadingTranslation(false);
+    }
+  };
+  useEffect(() => {
+    if (
+      effectiveTranslationOn &&
+      question.selectedLanguage !== userPreferedLanguageName
+    ) {
+      void fetchTranslation();
+    }
+    if (question.selectedLanguage === userPreferedLanguageName) {
+      setTranslatedQuestion(questionId, question.question);
+      if (question.choices) {
+        const choiceTexts = question.choices.map((choice) =>
+          typeof choice === "string"
+            ? choice
+            : choice?.choice || String(choice),
+        );
+        setTranslatedChoices(questionId, choiceTexts);
+      }
+    }
+  }, [question.selectedLanguage]);
+  useEffect(() => {
+    if (!globalLanguage) {
+      const browserLanguage = navigator.language || navigator.languages[0];
+      const detectedLanguage =
+        languages.find((lang) => lang.code === browserLanguage)?.name ||
+        userPreferedLanguageName;
+
+      setGlobalLanguage(detectedLanguage);
+    }
+  }, [globalLanguage, setGlobalLanguage]);
+
+  useEffect(() => {
+    if (!question.selectedLanguage) {
+      setSelectedLanguage(
+        questionId,
+        globalLanguage || userPreferedLanguageName,
+      );
+    }
+  }, [questionId, globalLanguage, setSelectedLanguage]);
+
+  const handleLanguageChange = (newLanguage: string) => {
+    setSelectedLanguage(questionId, newLanguage);
+    if (newLanguage !== userPreferedLanguageName) {
+      setGlobalLanguage(newLanguage);
+    }
+  };
+  return (
+    <section
+      id={`item-${questionNumber}`}
+      onClick={(e) => {
+        if (questionDisplay === "ALL_PER_PAGE") {
+          if (isInteractiveTarget(e.target)) return;
+          setActiveQuestionNumber(questionNumber);
+        }
+      }}
+      className={cn(
+        "flex bg-white dark:bg-gray-800 rounded flex-col gap-y-4 p-4 sm:p-6 relative shadow hover:shadow-md border ",
+        className,
+        `${activeQuestionNumber === questionNumber ? "border-violet-600" : ""}`,
+      )}
+    >
+      <div className="flex flex-col sm:flex-row sm:justify-between gap-3 sm:gap-0 sm:items-center pb-4 border-b">
+        <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-x-2">
+          <p className="text-gray-700 dark:text-gray-200 text-lg sm:text-xl font-semibold">
+            Question {questionNumber}
+          </p>
+          <div className="flex items-center gap-x-2">
+            <span className="hidden sm:inline text-md text-gray-600 dark:text-gray-400">
+              |
+            </span>
+            <span className="text-sm sm:text-md text-gray-600 dark:text-gray-300 bg-gray-100 dark:bg-gray-700 px-2 py-1 rounded-md sm:bg-transparent dark:sm:bg-transparent sm:px-0 sm:py-0">
+              {questionTypeText}
+            </span>
+          </div>
+        </div>
+        <div className="flex items-center justify-between sm:justify-start gap-x-2">
+          <button
+            className="text-gray-600 dark:text-gray-400 font-medium flex items-center group gap-x-2 hover:text-violet-600 dark:hover:text-violet-400 transition"
+            onClick={handleFlaggingQuestion}
+          >
+            <Bookmark questionStatus={questionStatus} />
+            <span className="text-sm sm:hidden">Flag</span>
+          </button>
+          {requiredQuestion && (
+            <span className="text-xs sm:text-sm rounded-md px-2 py-1 bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300">
+              Required
+            </span>
+          )}
+          <span className="text-sm sm:text-md text-violet-600 bg-violet-100 dark:bg-violet-900/40 dark:text-violet-300 rounded-md px-2 py-1">
+            {question.totalPoints} points
+          </span>
+        </div>
+      </div>
+
+      <div className="flex flex-col sm:flex-row sm:justify-between gap-3">
+        <div className="flex-grow">
+          {question.translationStatus === "pending" && (
+            <div className="mb-3 flex items-start gap-3 px-3 py-2 rounded-md bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700">
+              <ClockIcon className="h-5 w-5 text-gray-500 dark:text-gray-400 flex-shrink-0 mt-0.5" />
+              <div className="flex-1 space-y-1">
+                <span className="typography-caption text-gray-700 dark:text-gray-200">
+                  Translation in progress
+                </span>
+                <p className="text-sm text-gray-600 dark:text-gray-400">
+                  A translation into{" "}
+                  {getLanguageName(userPreferedLanguage) ||
+                    "your selected language"}{" "}
+                  is being prepared. You can answer in English now — refresh the
+                  page to see the translation when it&apos;s ready.
+                </p>
+              </div>
+              <span className="sr-only" aria-live="polite">
+                Translation in progress for this question.
+              </span>
+            </div>
+          )}
+          {question.translationStatus === "unavailable" && (
+            <div className="mb-3 flex items-start gap-3 px-3 py-2 rounded-md bg-yellow-100 border border-yellow-500">
+              <ExclamationTriangleIcon className="h-5 w-5 text-yellow-700 flex-shrink-0 mt-0.5" />
+              <div className="flex-1 space-y-1">
+                <span className="typography-caption text-yellow-700">
+                  Translation unavailable
+                </span>
+                <p className="text-sm text-yellow-900">
+                  A translation into{" "}
+                  {getLanguageName(userPreferedLanguage) ||
+                    "your selected language"}{" "}
+                  could not be prepared. The English version is shown below —
+                  your answer is saved either way.
+                </p>
+              </div>
+              <span className="sr-only" aria-live="polite">
+                Translation unavailable for this question; English shown.
+              </span>
+            </div>
+          )}
+          <div className="mb-2">
+            <MarkdownViewer
+              className="text-gray-800 dark:text-gray-200 px-2 border-gray-300 dark:border-gray-600 text-sm sm:text-base"
+              id={`question-${question.id}-original`}
+              allowCopy={!(questionControls?.disableCopy ?? false)}
+            >
+              {question.translations?.[userPreferedLanguage]?.translatedText ??
+                question.question}
+            </MarkdownViewer>
+          </div>
+
+          {effectiveTranslationOn && loadingTranslation && (
+            <div className="mt-3 pt-3 border-t border-gray-200 dark:border-gray-700">
+              <div className="flex items-center gap-2 mb-2">
+                {/* Opted out so the 1.2s cycle does not re-scan the whole route. */}
+                <span
+                  data-no-ui-translate="true"
+                  className="text-xs px-2 py-1 bg-gray-100 dark:bg-gray-700 rounded-full text-gray-500 dark:text-gray-400"
+                >
+                  {currentWord}...
+                </span>
+              </div>
+              <div className="bg-gray-50 dark:bg-gray-900 rounded-lg p-3 animate-pulse">
+                <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded w-3/4"></div>
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="flex items-center justify-between sm:justify-start gap-x-3 pt-2 sm:pt-0 border-t sm:border-t-0 sm:ml-4">
+          <div className="flex items-center gap-2">
+            <LanguageIcon
+              className={`h-5 w-5 sm:h-6 sm:w-6 ${
+                effectiveTranslationOn ? "text-violet-600" : "text-gray-600"
+              }`}
+            />
+
+            <span className="text-sm text-gray-600 dark:text-gray-400 sm:hidden">
+              Translation
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={toggleTranslation}
+            disabled={isAuthorPreview}
+            title={
+              isAuthorPreview ? TRANSLATION_PREVIEW_DISABLED_TOOLTIP : undefined
+            }
+            className={cn(
+              "relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none",
+              effectiveTranslationOn
+                ? "bg-violet-600"
+                : "bg-gray-200 dark:bg-gray-600",
+              "disabled:opacity-50 disabled:cursor-not-allowed",
+            )}
+            role="switch"
+            aria-checked={effectiveTranslationOn}
+          >
+            <span
+              aria-hidden="true"
+              className={cn(
+                "pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out",
+                effectiveTranslationOn ? "translate-x-5" : "translate-x-0",
+              )}
+            />
+          </button>
+        </div>
+      </div>
+      {isAuthorView && question.authorComment?.trim() && (
+        <div className="mt-6 border border-violet-200 dark:border-violet-800 rounded-md p-4 bg-white dark:bg-gray-800">
+          <p className="text-sm font-semibold text-violet-800 dark:text-violet-300 mb-2">
+            Private Author Comment (Not visible to learners)
+          </p>
+
+          <div className="border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 rounded-md p-3">
+            <MarkdownViewer
+              className="text-sm text-gray-800 dark:text-gray-200 whitespace-pre-wrap"
+              id={`question-${question.id}-author-comment`}
+            >
+              {question.authorComment}
+            </MarkdownViewer>
+          </div>
+        </div>
+      )}
+      {checkToShowRubric() && (
+        <ShowHideRubric
+          rubrics={question.scoring.rubrics}
+          showRubrics={showRubrics}
+          showPoints={showPoints}
+        />
+      )}
+
+      {effectiveTranslationOn ? (
+        <>
+          {question.type === "SINGLE_CORRECT" ||
+          question.type === "MULTIPLE_CORRECT" ? (
+            <>
+              {effectiveTranslationOn &&
+                question.translatedQuestion &&
+                question.translatedQuestion !== question.question && (
+                  <div className="mt-3 pt-3 border-t border-gray-200 dark:border-gray-700">
+                    <div className="flex items-center gap-2 mb-2">
+                      <span className="text-xs px-2 py-1 bg-violet-100 dark:bg-violet-900/40 rounded-full text-violet-600 dark:text-violet-300">
+                        Translated
+                      </span>
+                    </div>
+                    <MarkdownViewer
+                      className="text-gray-700 dark:text-gray-200 px-2 border-gray-300 dark:border-gray-600 bg-violet-50 dark:bg-violet-900/20 rounded-lg p-3"
+                      id={`question-${question.id}-translated`}
+                    >
+                      {question.translatedQuestion}
+                    </MarkdownViewer>
+                  </div>
+                )}
+
+              <div className="flex flex-col lg:grid lg:grid-cols-2 gap-4 lg:gap-12 relative">
+                <div className="hidden lg:flex absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-10">
+                  <ArrowRightIcon className="w-6 h-6 text-black dark:text-white" />
+                </div>
+
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between border-b border-gray-200 dark:border-gray-700 pb-2">
+                    <span className="text-sm font-medium text-gray-700 dark:text-gray-200">
+                      {userPreferedLanguageName || "Original"}
+                    </span>
+                    <span className="text-xs px-2 py-1 bg-gray-100 dark:bg-gray-700 rounded-full text-gray-600 dark:text-gray-300">
+                      Original
+                    </span>
+                  </div>
+                  <div className="bg-gray-50 dark:bg-gray-900 rounded-lg p-3 sm:p-4">
+                    <RenderQuestion
+                      questionType={question.type}
+                      question={{
+                        ...question,
+                        choices: question?.choices?.map((choice, index) =>
+                          question.translations?.[userPreferedLanguage]
+                            ?.translatedChoices
+                            ? question.translations[userPreferedLanguage]
+                                .translatedChoices[index]
+                            : choice,
+                        ),
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-3 border-t lg:border-t-0 pt-4 lg:pt-0">
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 border-b border-gray-200 dark:border-gray-700 pb-2">
+                    <select
+                      className="text-sm font-medium border border-gray-300 dark:border-gray-600 rounded px-2 py-1 bg-white dark:bg-gray-800 dark:text-gray-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                      value={question.selectedLanguage}
+                      onChange={(e) => handleLanguageChange(e.target.value)}
+                      disabled={isAuthorPreview}
+                      title={
+                        isAuthorPreview
+                          ? TRANSLATION_PREVIEW_DISABLED_TOOLTIP
+                          : undefined
+                      }
+                    >
+                      {languages.map((lang) => (
+                        <option key={lang.code} value={lang.name}>
+                          {lang.name}
+                        </option>
+                      ))}
+                    </select>
+                    <span className="text-xs px-2 py-1 bg-violet-100 rounded-full text-violet-600 self-start sm:self-auto">
+                      Translation
+                    </span>
+                  </div>
+                  {loadingTranslation ? (
+                    <div className="flex items-center justify-center py-8 min-h-[120px] sm:min-h-[200px]">
+                      <div className="text-center">
+                        <div
+                          data-no-ui-translate="true"
+                          className="animate-pulse text-violet-600 mb-2 text-sm"
+                        >
+                          {currentWord}...
+                        </div>
+                        <div className="text-xs sm:text-sm text-gray-500 dark:text-gray-400">
+                          Loading translation
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="bg-violet-50 dark:bg-violet-900/20 rounded-lg p-3 sm:p-4">
+                      <RenderQuestion
+                        questionType={question.type}
+                        question={{
+                          ...question,
+                          choices: question?.choices?.map((choice, index) =>
+                            question.translations?.[
+                              getLanguageCode(question.selectedLanguage)
+                            ]?.translatedChoices
+                              ? question.translations[
+                                  getLanguageCode(question.selectedLanguage)
+                                ].translatedChoices[index]
+                              : choice,
+                          ),
+                        }}
+                      />
+                    </div>
+                  )}
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between border-t border-gray-200 dark:border-gray-700 pt-4">
+                <select
+                  className="text-sm font-medium border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 dark:text-gray-200 rounded px-2 py-1 disabled:opacity-50 disabled:cursor-not-allowed"
+                  value={question.selectedLanguage}
+                  onChange={(e) => handleLanguageChange(e.target.value)}
+                  disabled={isAuthorPreview}
+                  title={
+                    isAuthorPreview
+                      ? TRANSLATION_PREVIEW_DISABLED_TOOLTIP
+                      : undefined
+                  }
+                >
+                  {languages.map((lang) => (
+                    <option key={lang.code} value={lang.name}>
+                      {lang.name}
+                    </option>
+                  ))}
+                </select>
+                <span className="text-xs px-2 py-1 bg-violet-100 rounded-full text-violet-600">
+                  Translation
+                </span>
+              </div>
+              <MarkdownViewer className="text-gray-800 dark:text-gray-200 px-2 border-gray-300 dark:border-gray-600 font-semibold">
+                {question.translatedQuestion || question.question}
+              </MarkdownViewer>
+
+              <RenderQuestion
+                questionType={question.type}
+                question={{
+                  ...question,
+                  choices: question?.choices?.map((choice, index) =>
+                    question.translations?.[userPreferedLanguage]
+                      ?.translatedChoices
+                      ? question.translations[userPreferedLanguage]
+                          .translatedChoices[index]
+                      : choice,
+                  ),
+                }}
+              />
+            </div>
+          )}
+        </>
+      ) : (
+        <RenderQuestion
+          questionType={question.type}
+          question={{
+            ...question,
+            choices: question?.choices?.map((choice, index) =>
+              question.translations?.[userPreferedLanguage]?.translatedChoices
+                ? question.translations[userPreferedLanguage].translatedChoices[
+                    index
+                  ]
+                : choice,
+            ),
+          }}
+        />
+      )}
+
+      {/* Every layout needs a submit control the learner can reach by
+          scrolling: the header button sits outside the scroll container and
+          is easy to miss, and on a long single page there was nothing else. */}
+      {(questionDisplay === "ONE_PER_PAGE" ||
+        questionNumber === lastQuestionNumber) && (
+        <div
+          className={cn(
+            "flex flex-col sm:flex-row gap-3 sm:gap-0 pt-4 border-t border-gray-200 dark:border-gray-700",
+            questionDisplay === "ONE_PER_PAGE"
+              ? "justify-between"
+              : "sm:justify-end",
+          )}
+        >
+          {questionDisplay === "ONE_PER_PAGE" && (
+            <button
+              onClick={() => setActiveQuestionNumber(questionNumber - 1)}
+              disabled={questionNumber === 1}
+              className="disabled:opacity-50 disabled:pointer-events-none text-gray-600 dark:text-gray-400 font-medium flex items-center justify-center sm:justify-start group gap-x-2 hover:text-violet-600 dark:hover:text-violet-400 transition px-4 py-2 sm:px-0 sm:py-0 border sm:border-0 rounded-md sm:rounded-none"
+            >
+              <ArrowLongLeftIcon
+                strokeWidth={2}
+                className="w-4 h-4 sm:w-5 sm:h-5 transition-transform group-hover:-translate-x-1"
+              />
+
+              <span className="text-sm sm:text-base">Previous Question</span>
+            </button>
+          )}
+          {questionNumber === lastQuestionNumber ? (
+            <button
+              onClick={() => {
+                const submitEvent = new CustomEvent(
+                  "triggerAssignmentSubmission",
+                );
+                window.dispatchEvent(submitEvent);
+              }}
+              disabled={isUploadingFiles}
+              title={isUploadingFiles ? UPLOAD_IN_PROGRESS_TOOLTIP : undefined}
+              className="text-white bg-violet-600 hover:bg-violet-700 font-medium flex items-center justify-center sm:justify-start group gap-x-2 transition px-4 py-2 border rounded-md disabled:opacity-50 disabled:pointer-events-none"
+            >
+              <span className="text-sm sm:text-base">Submit Assignment</span>
+              <PaperAirplaneIcon
+                strokeWidth={2}
+                className="w-4 h-4 sm:w-5 sm:h-5 transition-transform group-hover:translate-x-1"
+              />
+            </button>
+          ) : (
+            <button
+              onClick={() => setActiveQuestionNumber(questionNumber + 1)}
+              className="text-gray-600 dark:text-gray-400 font-medium flex items-center justify-center sm:justify-start group gap-x-2 hover:text-violet-600 dark:hover:text-violet-400 transition px-4 py-2 sm:px-0 sm:py-0 border sm:border-0 rounded-md sm:rounded-none"
+            >
+              <span className="text-sm sm:text-base">Next Question</span>
+              <ArrowLongRightIcon
+                strokeWidth={2}
+                className="w-4 h-4 sm:w-5 sm:h-5 transition-transform group-hover:translate-x-1"
+              />
+            </button>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+export default Component;
+
+function Bookmark({ questionStatus }) {
+  return questionStatus === "flagged" ? (
+    <TagIcon className="w-5 h-5 text-violet-600" />
+  ) : (
+    <OutlineTagIcon className="w-5 h-5 text-violet-600" />
+  );
+}

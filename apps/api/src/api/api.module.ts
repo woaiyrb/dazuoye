@@ -1,0 +1,41 @@
+import { Module } from "@nestjs/common";
+import { JobExecutorController } from "src/job-queue/job-executor.controller";
+import { JobExecutorService } from "src/job-queue/job-executor.service";
+import { SharedModule } from "src/shared.module";
+import { AdminModule } from "./admin/admin.module";
+import { AiFeatureFlagsModule } from "./ai-feature-flags/ai-feature-flags.module";
+import { ApiController } from "./api.controller";
+import { ApiService } from "./api.service";
+import { AssignmentModuleV1 } from "./assignment/v1/modules/assignment.module";
+import { AssignmentModuleV2 } from "./assignment/v2/modules/assignment.module";
+import { AttemptModule } from "./attempt/attempt.module";
+import { FilesModule } from "./files/files.module";
+import { GithubModule } from "./github/github.module";
+import { JobModule } from "./Job/job.module";
+import { LlmModule } from "./llm/llm.module";
+import { ReportsModule } from "./report/report.module";
+import { ChatModule } from "./user/modules/chat.module";
+import { ClassModule } from "./class/class.module";
+import { KnowledgePointModule } from "./knowledge-point/knowledge-point.module";
+
+@Module({
+  controllers: [ApiController, JobExecutorController],
+  providers: [ApiService, JobExecutorService],
+  imports: [
+    SharedModule,
+    AiFeatureFlagsModule,
+    LlmModule,
+    AssignmentModuleV1,
+    AssignmentModuleV2,
+    AttemptModule,
+    AdminModule,
+    GithubModule,
+    JobModule,
+    ReportsModule,
+    ChatModule,
+    FilesModule,
+    ClassModule,
+    KnowledgePointModule,
+  ],
+})
+export class ApiModule {}

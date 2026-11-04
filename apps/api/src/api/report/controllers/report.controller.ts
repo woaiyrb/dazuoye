@@ -1,0 +1,359 @@
+/* eslint-disable @typescript-eslint/require-await */
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  DefaultValuePipe,
+  Get,
+  Header,
+  Injectable,
+  Logger,
+  Param,
+  ParseIntPipe,
+  Patch,
+  Post,
+  Query,
+  Req,
+  UploadedFile,
+  UseGuards,
+  UseInterceptors,
+} from "@nestjs/common";
+import { FileInterceptor } from "@nestjs/platform-express";
+import { ApiOperation, ApiQuery, ApiTags } from "@nestjs/swagger";
+import { ReportStatus } from "@prisma/client";
+import { memoryStorage } from "multer";
+import { AssignmentAccessControlGuard } from "src/api/assignment/guards/assignment.access.control.guard";
+import { AdminGuard } from "src/auth/guards/admin.guard";
+import {
+  UserRole,
+  UserSessionRequest,
+} from "src/auth/interfaces/user.session.interface";
+import { Roles } from "src/auth/role/roles.global.guard";
+import { derivePortalContext } from "src/common/portal/portal-context";
+import { sanitizeReportDiagnostics } from "../helpers/report-diagnostics";
+import { ReportsService } from "../services/report.service";
+
+@ApiTags("Reports")
+@Injectable()
+@Controller({
+  path: "reports",
+  version: "1",
+})
+export class ReportsController {
+  private readonly logger = new Logger(ReportsController.name);
+
+  constructor(private readonly reportsService: ReportsService) {}
+  @Get("feedback")
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary: "Get all assignment feedback with pagination and filtering",
+  })
+  @ApiQuery({ name: "page", required: false, type: Number, example: 1 })
+  @ApiQuery({ name: "limit", required: false, type: Number, example: 20 })
+  @ApiQuery({ name: "search", required: false, type: String })
+  @ApiQuery({ name: "assignmentId", required: false, type: Number })
+  @ApiQuery({ name: "allowContact", required: false, type: Boolean })
+  @ApiQuery({ name: "startDate", required: false, type: String })
+  @ApiQuery({ name: "endDate", required: false, type: String })
+  async getFeedback(
+    @Query("page", new DefaultValuePipe(1), ParseIntPipe) page: number,
+    @Query("limit", new DefaultValuePipe(20), ParseIntPipe) limit: number,
+    @Query("search") search?: string,
+    @Query("allowContact") allowContact?: string,
+    @Query("startDate") startDate?: string,
+    @Query("endDate") endDate?: string,
+    @Req() request?: UserSessionRequest,
+  ) {
+    const userSession = request?.userSession
+      ? {
+          userId: request.userSession.userId,
+          role: request.userSession.role,
+          assignmentId: undefined,
+          groupId: undefined,
+        }
+      : request?.userSession;
+
+    return this.reportsService.getFeedback({
+      page,
+      limit,
+      search,
+      assignmentId: undefined,
+      allowContact:
+        allowContact === "true"
+          ? true
+          : allowContact === "false"
+            ? false
+            : undefined,
+      startDate,
+      endDate,
+      userSession,
+    });
+  }
+
+  @Get()
+  @UseGuards(AdminGuard)
+  @ApiOperation({ summary: "Get all reports with pagination and filtering" })
+  @ApiQuery({ name: "page", required: false, type: Number, example: 1 })
+  @ApiQuery({ name: "limit", required: false, type: Number, example: 20 })
+  @ApiQuery({ name: "search", required: false, type: String })
+  @ApiQuery({ name: "assignmentId", required: false, type: Number })
+  @ApiQuery({ name: "status", required: false, type: String })
+  @ApiQuery({ name: "issueType", required: false, type: String })
+  @ApiQuery({ name: "startDate", required: false, type: String })
+  @ApiQuery({ name: "endDate", required: false, type: String })
+  async getReports(
+    @Query("page", new DefaultValuePipe(1), ParseIntPipe) page: number,
+    @Query("limit", new DefaultValuePipe(20), ParseIntPipe) limit: number,
+    @Query("search") search?: string,
+    @Query("status") status?: string,
+    @Query("issueType") issueType?: string,
+    @Query("startDate") startDate?: string,
+    @Query("endDate") endDate?: string,
+  ) {
+    return this.reportsService.getReports({
+      page,
+      limit,
+      search,
+      assignmentId: undefined,
+      status: status,
+      issueType: issueType,
+      startDate,
+      endDate,
+    });
+  }
+
+  @Get("renewal-action")
+  @Header("Content-Type", "text/html")
+  @ApiOperation({
+    summary: "Handle bug renewal email action",
+  })
+  async handleBugRenewalAction(
+    @Query("token") token?: string,
+    @Query("action") action?: string,
+  ) {
+    return this.reportsService.handleBugRenewalAction(token, action);
+  }
+  @Post()
+  @UseInterceptors(
+    FileInterceptor("screenshot", {
+      storage: memoryStorage(),
+      limits: {
+        fileSize: 10 * 1024 * 1024,
+      },
+    }),
+  )
+  async reportIssue(
+    @Body()
+    dto: {
+      issueType: string;
+      description: string;
+      assignmentId?: number;
+      attemptId?: number;
+      severity?: "info" | "warning" | "error" | "critical";
+      category?: string;
+      portalName?: string;
+      userEmail?: string;
+      userRole?: string;
+      pageUrl?: string;
+      browser?: string;
+      diagnostics?: string;
+      additionalDetails?: Record<string, any>;
+    },
+    @UploadedFile() screenshot: Express.Multer.File,
+    @Req() request: UserSessionRequest,
+  ): Promise<{ message: string; reportId?: number }> {
+    const resolvedUserEmail = dto.userEmail || request.userSession?.userId;
+    // Portal identity is taken from the signed session, never from the client,
+    // so a report cannot claim to come from a portal it did not launch from.
+    const portal = derivePortalContext(request.userSession);
+    const additionalDetails: Record<string, any> = {
+      ...dto.additionalDetails,
+      category: dto.category,
+      userEmail: resolvedUserEmail,
+    };
+    if (dto.pageUrl) additionalDetails.pageUrl = dto.pageUrl;
+    if (dto.browser) additionalDetails.browser = dto.browser;
+
+    // Written by the browser, so it is rebuilt from known keys before anything
+    // keeps it, and a bad capture never fails the report it rides on.
+    const diagnostics = sanitizeReportDiagnostics(dto.diagnostics);
+    if (dto.diagnostics !== undefined && !diagnostics) {
+      this.logger.warn("reportIssue: dropped an unusable diagnostics field", {
+        user_id: request.userSession?.userId,
+        assignment_id: request.userSession?.assignmentId,
+        bytes:
+          typeof dto.diagnostics === "string" ? dto.diagnostics.length : -1,
+      });
+    }
+
+    const reportDto = {
+      issueType: dto.issueType,
+      description: dto.description,
+      assignmentId: dto.assignmentId,
+      attemptId: dto.attemptId,
+      severity: dto.severity,
+      userEmail: resolvedUserEmail,
+      portal,
+      additionalDetails,
+      diagnostics,
+    };
+    return this.reportsService.reportIssue(
+      reportDto,
+      request.userSession,
+      screenshot,
+    );
+  }
+
+  @Get(":id/diagnostics")
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary: "What the reporter's browser held when the report was filed",
+  })
+  async getReportDiagnostics(
+    @Param("id", ParseIntPipe) id: number,
+    @Req() request: UserSessionRequest,
+  ) {
+    this.logger.log("getReportDiagnostics: admin read", {
+      report_id: id,
+      admin: request.userSession?.userId,
+    });
+    return this.reportsService.getReportDiagnostics(id);
+  }
+
+  @Get("assignment/:id")
+  @UseGuards(AssignmentAccessControlGuard)
+  @Roles(UserRole.AUTHOR, UserRole.ADMIN)
+  async getReportsForAssignment(@Param("id") id: string) {
+    return this.reportsService.getReportsForAssignment(Number(id));
+  }
+
+  @Get("user")
+  @UseGuards(AssignmentAccessControlGuard)
+  async getReportsForUser(@Req() request: UserSessionRequest) {
+    const userId = request.userSession?.userId;
+    if (!userId) {
+      throw new BadRequestException("User ID is required");
+    }
+    return this.reportsService.getReportsForUser(userId);
+  }
+
+  @Get(":id/comments")
+  async getReportComments(
+    @Param("id") id: string,
+    @Req() request: UserSessionRequest,
+  ) {
+    if (!request?.userSession?.userId) {
+      throw new BadRequestException("User session missing");
+    }
+
+    return this.reportsService.getReportComments(
+      Number(id),
+      request.userSession,
+    );
+  }
+
+  @Post(":id/comments")
+  async addReportComment(
+    @Param("id") id: string,
+    @Body("comment") comment: string,
+    @Req() request: UserSessionRequest,
+  ) {
+    if (!comment?.trim()) {
+      throw new BadRequestException("Comment is required");
+    }
+    if (!request?.userSession?.userId) {
+      throw new BadRequestException("User session missing");
+    }
+
+    return this.reportsService.addReportComment(
+      Number(id),
+      comment,
+      request.userSession,
+    );
+  }
+
+  @Get(":id")
+  @UseGuards(AssignmentAccessControlGuard)
+  async getReportById(
+    @Param("id") id: string,
+    @Req() request: UserSessionRequest,
+  ) {
+    const userId = request.userSession?.userId;
+    if (!userId) {
+      throw new BadRequestException("User ID is required");
+    }
+    return this.reportsService.getReportDetailsForUser(Number(id), userId);
+  }
+
+  @Patch(":id/status")
+  @UseGuards(AssignmentAccessControlGuard)
+  @Roles(UserRole.AUTHOR, UserRole.ADMIN)
+  async updateReportStatus(
+    @Param("id") id: string,
+    @Body()
+    updateData: {
+      status: ReportStatus;
+      statusMessage?: string;
+      resolution?: string;
+    },
+  ) {
+    return this.reportsService.updateReportStatus(
+      Number(id),
+      updateData.status,
+      updateData.statusMessage,
+      updateData.resolution,
+    );
+  }
+
+  @Patch(":id/screenshot")
+  @UseGuards(AssignmentAccessControlGuard)
+  async addScreenshotToReport(
+    @Param("id") id: string,
+    @Body()
+    screenshotData: {
+      screenshotUrl: string;
+      bucket?: string;
+    },
+    @Req() request: UserSessionRequest,
+  ) {
+    const userId = request.userSession?.userId;
+    if (!userId) {
+      throw new BadRequestException("User ID is required");
+    }
+    return this.reportsService.addScreenshotToReport(
+      Number(id),
+      screenshotData.screenshotUrl,
+      userId,
+      screenshotData.bucket,
+    );
+  }
+
+  @Post("feedback")
+  @UseGuards(AssignmentAccessControlGuard)
+  async sendUserFeedback(
+    @Body()
+    feedbackDto: {
+      title: string;
+      description: string;
+      rating: string;
+      assignmentId?: number;
+      userEmail?: string;
+      portalName?: string;
+    },
+    @Req() request: UserSessionRequest,
+  ) {
+    const portal = derivePortalContext(request.userSession);
+    return this.reportsService.sendUserFeedback({
+      title: feedbackDto.title,
+      description: feedbackDto.description,
+      rating: feedbackDto.rating,
+      userEmail: feedbackDto.userEmail || request.userSession?.userId,
+      portalName:
+        portal.portalName || feedbackDto.portalName || "Mark AI Assistant",
+      portalUrl: portal.portalUrl,
+      userId: request.userSession?.userId,
+      assignmentId:
+        feedbackDto.assignmentId || request.userSession?.assignmentId,
+    });
+  }
+}

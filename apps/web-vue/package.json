@@ -1,0 +1,21 @@
+{
+  "name": "zuoye-web-vue",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 3020",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 3020"
+  },
+  "dependencies": {
+    "@lucide/vue": "^1.67.0",
+    "katex": "^0.19.1",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "vite": "^6.0.8"
+  }
+}

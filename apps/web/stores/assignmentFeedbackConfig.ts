@@ -1,0 +1,119 @@
+import type {
+  FeedbackData,
+  VerbosityLevels,
+  CorrectAnswerVisibility,
+} from "../config/types";
+import { withUpdatedAt } from "./middlewares";
+import { createAssignmentScopedStorage } from "@/lib/assignment-storage";
+import { extractAssignmentId } from "@/lib/strings";
+import { createJSONStorage, devtools, persist } from "zustand/middleware";
+import { createWithEqualityFn } from "zustand/traditional";
+
+type FeedbackDataActions = {
+  setVerbosityLevel: (verbosityLevel: VerbosityLevels) => void;
+
+  toggleShowSubmissionFeedback: () => void;
+  toggleShowQuestionScore: () => void;
+  toggleShowAssignmentScore: () => void;
+  toggleShowQuestions: () => void;
+  toggleShowPassFailIndicator: () => void;
+
+  setShowSubmissionFeedback: (showSubmissionFeedback: boolean) => void;
+  setShowQuestionScore: (showQuestionScore: boolean) => void;
+  setShowPassFailIndicator: (showPassFailIndicator: boolean) => void;
+  setShowQuestion: (showQuestions: boolean) => void;
+  setShowAssignmentScore: (showAssignmentScore: boolean) => void;
+  setCorrectAnswerVisibility: (
+    correctAnswerVisibility: CorrectAnswerVisibility,
+  ) => void;
+
+  setUpdatedAt: (updatedAt: number) => void;
+  setAssignmentFeedbackConfigStore: (state: Partial<FeedbackData>) => void;
+  deleteStore: () => void;
+};
+
+export const useAssignmentFeedbackConfig = createWithEqualityFn<
+  FeedbackData & FeedbackDataActions
+>()(
+  persist(
+    devtools(
+      withUpdatedAt((set) => ({
+        verbosityLevel: "Full",
+        showSubmissionFeedback: true,
+        showQuestionScore: true,
+        showAssignmentScore: true,
+        showQuestions: true,
+        showPassFailIndicator: false,
+        correctAnswerVisibility: "ALWAYS",
+        setShowQuestion: (showQuestions: boolean) => set({ showQuestions }),
+        toggleShowQuestions: () =>
+          set((state) => ({ showQuestions: !state.showQuestions })),
+        setCorrectAnswerVisibility: (
+          correctAnswerVisibility: CorrectAnswerVisibility,
+        ) => {
+          if (typeof window !== "undefined") {
+            localStorage.removeItem("questions");
+            localStorage.removeItem("assignmentConfig");
+          }
+          set({ correctAnswerVisibility });
+        },
+        updatedAt: undefined,
+        setVerbosityLevel: (verbosityLevel) =>
+          set((state) => ({ ...state, verbosityLevel })),
+        toggleShowSubmissionFeedback: () =>
+          set((state) => ({
+            showSubmissionFeedback: !state.showSubmissionFeedback,
+          })),
+        setShowSubmissionFeedback: (showSubmissionFeedback: boolean) =>
+          set({ showSubmissionFeedback }),
+        toggleShowQuestionScore: () =>
+          set((state) => ({ showQuestionScore: !state.showQuestionScore })),
+        setShowQuestionScore: (showQuestionScore: boolean) =>
+          set({ showQuestionScore }),
+        toggleShowAssignmentScore: () =>
+          set((state) => ({ showAssignmentScore: !state.showAssignmentScore })),
+        setShowAssignmentScore: (showAssignmentScore: boolean) =>
+          set({ showAssignmentScore }),
+        toggleShowPassFailIndicator: () =>
+          set((state) => ({
+            showPassFailIndicator: !state.showPassFailIndicator,
+          })),
+        setShowPassFailIndicator: (showPassFailIndicator: boolean) =>
+          set({ showPassFailIndicator }),
+        setUpdatedAt: (updatedAt) => set({ updatedAt }),
+        setAssignmentFeedbackConfigStore: (state) =>
+          set((prevState) => ({ ...prevState, ...state })),
+        deleteStore: () =>
+          set(() => ({
+            verbosityLevel: "Full",
+            showSubmissionFeedback: true,
+            showQuestionScore: true,
+            showAssignmentScore: true,
+            showQuestions: true,
+            showPassFailIndicator: false,
+            correctAnswerVisibility: "ALWAYS",
+            updatedAt: undefined,
+          })),
+      })),
+    ),
+    {
+      name: getAuthorStoreName(),
+      storage: createJSONStorage(() =>
+        createAssignmentScopedStorage("feedbackConfig", getAuthorStoreName()),
+      ),
+      partialize(state) {
+        return Object.fromEntries(
+          Object.entries(state).filter(
+            ([, value]) => typeof value !== "function",
+          ),
+        );
+      },
+    },
+  ),
+);
+function getAuthorStoreName() {
+  if (typeof window !== "undefined") {
+    return `assignmentFeedbackConfig-${extractAssignmentId(window.location.pathname)}`;
+  }
+  return "assignmentFeedbackConfig-1";
+}

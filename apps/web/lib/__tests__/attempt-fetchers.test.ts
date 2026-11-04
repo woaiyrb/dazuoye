@@ -1,0 +1,218 @@
+/**
+ * @jest-environment node
+ */
+
+import { APIError, NetworkError } from "../api-client";
+import { getAttempts } from "../author";
+import { getAttempt, getCompletedAttempt } from "../learner";
+
+jest.mock("../api-client", () => {
+  const actual = jest.requireActual("../api-client");
+  return {
+    ...actual,
+    apiClient: { get: jest.fn(), post: jest.fn(), patch: jest.fn() },
+  };
+});
+
+// Retry pauses briefly between attempts; keep tests instant.
+jest.mock("../api-retry", () => {
+  const actual = jest.requireActual("../api-retry");
+  return {
+    ...actual,
+    withTransientRetry: async <T>(fn: () => Promise<T>): Promise<T> => {
+      try {
+        return await fn();
+      } catch (error) {
+        if (!actual.isTransientApiError(error)) throw error;
+        return fn();
+      }
+    },
+  };
+});
+
+const { apiClient }: { apiClient: { get: jest.Mock } } =
+  jest.requireMock("../api-client");
+
+const attemptRow = {
+  id: 7,
+  submitted: false,
+  expiresAt: null,
+  createdAt: "2026-07-01T00:00:00.000Z",
+};
+
+beforeEach(() => {
+  apiClient.get.mockReset();
+  jest.spyOn(console, "error").mockImplementation(() => undefined);
+});
+
+afterEach(() => {
+  jest.restoreAllMocks();
+});
+
+describe("getAttempts", () => {
+  it("recovers when the first request fails transiently", async () => {
+    apiClient.get
+      .mockRejectedValueOnce(new APIError("x", 503, "Service Unavailable"))
+      .mockResolvedValueOnce([attemptRow]);
+
+    const attempts = await getAttempts(1);
+
+    expect(attempts).toHaveLength(1);
+    expect(apiClient.get).toHaveBeenCalledTimes(2);
+  });
+
+  it("logs and returns undefined on persistent failure", async () => {
+    apiClient.get.mockRejectedValue(new APIError("x", 503, "x"));
+
+    await expect(getAttempts(1)).resolves.toBeUndefined();
+    expect(console.error).toHaveBeenCalled();
+  });
+
+  it("suppresses the api-client toast via quiet mode", async () => {
+    apiClient.get.mockResolvedValue([attemptRow]);
+
+    await getAttempts(1);
+
+    expect(apiClient.get).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ quiet: true }),
+    );
+  });
+
+  it("rethrows auth failures when the caller opts in", async () => {
+    apiClient.get.mockRejectedValue(new APIError("x", 401, "Unauthorized"));
+
+    await expect(
+      getAttempts(1, undefined, { throwOnAuthError: true }),
+    ).rejects.toMatchObject({ status: 401 });
+  });
+
+  it("swallows auth failures by default (legacy callers)", async () => {
+    apiClient.get.mockRejectedValue(new APIError("x", 401, "Unauthorized"));
+
+    await expect(getAttempts(1)).resolves.toBeUndefined();
+  });
+});
+
+describe("getAttempt", () => {
+  it("recovers when the first request fails transiently", async () => {
+    apiClient.get
+      .mockRejectedValueOnce(new TypeError("fetch failed"))
+      .mockResolvedValueOnce({ id: 7, questions: [] });
+
+    const attempt = await getAttempt(1, 7);
+
+    expect(attempt).toMatchObject({ id: 7 });
+    expect(apiClient.get).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry definitive failures", async () => {
+    apiClient.get.mockRejectedValue(new APIError("x", 404, "Not Found"));
+
+    await expect(getAttempt(1, 7)).resolves.toBeUndefined();
+    expect(apiClient.get).toHaveBeenCalledTimes(1);
+    expect(console.error).toHaveBeenCalled();
+  });
+
+  it("rethrows auth failures when the caller opts in", async () => {
+    apiClient.get.mockRejectedValue(new APIError("x", 403, "Forbidden"));
+
+    await expect(
+      getAttempt(1, 7, undefined, "en", { throwOnAuthError: true }),
+    ).rejects.toMatchObject({ status: 403 });
+  });
+});
+
+describe("getCompletedAttempt", () => {
+  it("propagates an access failure instead of reporting the attempt as missing", async () => {
+    apiClient.get.mockRejectedValue(new APIError("x", 403, "Forbidden"));
+
+    await expect(
+      getCompletedAttempt(1, 7, undefined, { throwOnAuthError: true }),
+    ).rejects.toMatchObject({ status: 403 });
+  });
+
+  it("propagates an expired session", async () => {
+    apiClient.get.mockRejectedValue(new APIError("x", 401, "Unauthorized"));
+
+    await expect(
+      getCompletedAttempt(1, 7, undefined, { throwOnAuthError: true }),
+    ).rejects.toMatchObject({ status: 401 });
+  });
+
+  it("still resolves to undefined for a genuinely missing attempt", async () => {
+    apiClient.get.mockRejectedValue(new APIError("x", 404, "Not Found"));
+
+    await expect(
+      getCompletedAttempt(1, 7, undefined, { throwOnAuthError: true }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("logs the failure it swallows rather than discarding it silently", async () => {
+    apiClient.get.mockRejectedValue(new APIError("x", 500, "Server Error"));
+
+    await expect(getCompletedAttempt(1, 7)).resolves.toBeUndefined();
+    expect(console.error).toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a server fault", new APIError("x", 500, "Server Error"), 500],
+    ["a gateway failure", new APIError("x", 502, "Bad Gateway"), 502],
+  ])(
+    "propagates %s so the page reports the real status, not a missing attempt",
+    async (_label, thrown, status) => {
+      apiClient.get.mockRejectedValue(thrown);
+
+      await expect(
+        getCompletedAttempt(1, 7, undefined, { throwOnError: true }),
+      ).rejects.toMatchObject({ status });
+    },
+  );
+
+  it("propagates a dropped connection instead of reporting the attempt as missing", async () => {
+    // fetch rejects with a TypeError when the connection fails; reporting that
+    // as "no such attempt" is how a learner gets told their own submission is
+    // not theirs.
+    apiClient.get.mockRejectedValue(new TypeError("fetch failed"));
+
+    await expect(
+      getCompletedAttempt(1, 7, undefined, { throwOnError: true }),
+    ).rejects.toBeInstanceOf(TypeError);
+  });
+
+  it("still resolves to undefined for a genuinely missing attempt when propagating", async () => {
+    apiClient.get.mockRejectedValue(new APIError("x", 404, "Not Found"));
+
+    await expect(
+      getCompletedAttempt(1, 7, undefined, { throwOnError: true }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("never calls the API for the author-preview sentinel id", async () => {
+    await expect(
+      getCompletedAttempt(1, -1, undefined, { throwOnAuthError: true }),
+    ).resolves.toBeUndefined();
+    expect(apiClient.get).not.toHaveBeenCalled();
+  });
+
+  // A request that produced no response is not a missing attempt. Returning
+  // undefined for it is what let the results page tell a learner on a dropped
+  // connection that their submission belonged to someone else.
+  it("rethrows a request that never reached the server", async () => {
+    apiClient.get.mockRejectedValue(
+      new NetworkError("Request timed out after 30000ms", "timeout"),
+    );
+
+    await expect(getCompletedAttempt(1, 7)).rejects.toMatchObject({
+      name: "NetworkError",
+      kind: "timeout",
+    });
+  });
+
+  it("still resolves undefined when the server answered with a failure", async () => {
+    apiClient.get.mockRejectedValue(new APIError("x", 404, "Not Found"));
+
+    await expect(getCompletedAttempt(1, 7)).resolves.toBeUndefined();
+    expect(console.error).toHaveBeenCalled();
+  });
+});

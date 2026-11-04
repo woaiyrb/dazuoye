@@ -1,0 +1,1003 @@
+/* eslint-disable @typescript-eslint/no-unsafe-assignment */
+/* eslint-disable unicorn/prefer-module */
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { PromptTemplate } from "@langchain/core/prompts";
+import { HttpException, HttpStatus, Inject, Injectable } from "@nestjs/common";
+import { AIUsageType } from "@prisma/client";
+import { StructuredOutputParser } from "@langchain/classic/output_parsers";
+import { WINSTON_MODULE_PROVIDER } from "nest-winston";
+import { decodeIfBase64 } from "src/helpers/decoder";
+import { Logger } from "winston";
+import { z } from "zod";
+import { Choice } from "../../../../assignment/dto/update.questions.request.dto";
+import { LlmRequestOptions } from "../../../core/interfaces/llm-provider.interface";
+import { IPromptProcessor } from "../../../core/interfaces/prompt-processor.interface";
+import { PROMPT_PROCESSOR } from "../../../llm.constants";
+import { ITranslationService } from "../interfaces/translation.interface";
+import {
+  hasLostMarkup,
+  prepareHtmlForTranslation,
+  restoreTranslatedHtml,
+} from "../utils/translatable-html.util";
+
+interface LanguageMapping {
+  code: string;
+  name: string;
+}
+
+@Injectable()
+export class TranslationService implements ITranslationService {
+  /**
+   * Translation calls are short (a question, a choice, a title), run 23+
+   * at a time, and sit behind a caller-side retry loop with a 90s
+   * per-attempt ceiling. The client timeout must come in well under that
+   * ceiling so a stalled connection fails the attempt while there is
+   * still budget to retry it; SDK-internal retries stay at 1 because the
+   * caller's loop owns retrying.
+   */
+  private static readonly LLM_CALL_OPTIONS: LlmRequestOptions = {
+    timeoutMs: 60_000,
+    maxRetries: 1,
+  };
+
+  private readonly logger: Logger;
+  private languageMap: Map<string, string> = new Map();
+
+  constructor(
+    @Inject(PROMPT_PROCESSOR)
+    private readonly promptProcessor: IPromptProcessor,
+    @Inject(WINSTON_MODULE_PROVIDER) parentLogger: Logger,
+  ) {
+    this.logger = parentLogger.child({ context: TranslationService.name });
+    this.loadLanguageMap();
+  }
+
+  /**
+   * Load language mappings from languages.json file
+   */
+  private loadLanguageMap(): void {
+    try {
+      const possiblePaths = [
+        path.join(process.cwd(), "../../apps/web/public/languages.json"),
+        path.join(process.cwd(), "../web/public/languages.json"),
+        path.join(
+          __dirname,
+          "../../../../../../apps/web/public/languages.json",
+        ),
+        path.join(__dirname, "../../../../../web/public/languages.json"),
+      ];
+
+      let languagesPath: string | null;
+      for (const testPath of possiblePaths) {
+        if (fs.existsSync(testPath)) {
+          languagesPath = testPath;
+          break;
+        }
+      }
+
+      if (languagesPath) {
+        const languagesData = fs.readFileSync(languagesPath, "utf8");
+        const languages: LanguageMapping[] = JSON.parse(languagesData);
+
+        for (const lang of languages) {
+          this.languageMap.set(lang.code, lang.name);
+        }
+
+        this.logger.debug(
+          `Loaded ${this.languageMap.size} language mappings from ${languagesPath}`,
+        );
+      } else {
+        this.logger.warn(
+          "Languages file not found in any expected location, using default mappings",
+        );
+        this.loadDefaultLanguageMap();
+      }
+    } catch (error) {
+      this.logger.error(
+        `Error loading language mappings: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+      );
+      this.loadDefaultLanguageMap();
+    }
+  }
+
+  /**
+   * Load default language mappings as fallback
+   */
+  private loadDefaultLanguageMap(): void {
+    const defaultMappings: LanguageMapping[] = [
+      { code: "en", name: "English" },
+      { code: "id", name: "Bahasa Indonesia" },
+      { code: "de", name: "Deutsch" },
+      { code: "es", name: "Español" },
+      { code: "fr", name: "Français" },
+      { code: "it", name: "Italiano" },
+      { code: "hu", name: "Magyar" },
+      { code: "nl", name: "Nederlands" },
+      { code: "pl", name: "Polski" },
+      { code: "pt", name: "Português" },
+      { code: "sv", name: "Svenska" },
+      { code: "tr", name: "Türkçe" },
+      { code: "el", name: "Ελληνικά" },
+      { code: "kk", name: "Қазақ тілі" },
+      { code: "ru", name: "Русский" },
+      { code: "uk-UA", name: "Українська" },
+      { code: "ar", name: "العربية" },
+      { code: "hi", name: "हिन्दी" },
+      { code: "th", name: "ไทย" },
+      { code: "ko", name: "한국어" },
+      { code: "zh-CN", name: "简体中文" },
+      { code: "zh-TW", name: "繁體中文" },
+      { code: "ja", name: "日本語" },
+    ];
+
+    for (const lang of defaultMappings) {
+      this.languageMap.set(lang.code, lang.name);
+    }
+  }
+
+  /**
+   * Get language name from language code
+   */
+  private getLanguageName(languageCode: string): string {
+    return this.languageMap.get(languageCode) || languageCode;
+  }
+
+  /**
+   * Normalize arbitrary values into translatable text.
+   * Returns null for unsupported or empty values.
+   */
+  private normalizeTranslatableText(value: unknown): string | null {
+    if (typeof value === "string") {
+      return value.trim().length > 0 ? value : null;
+    }
+
+    if (typeof value === "number" || typeof value === "boolean") {
+      return String(value);
+    }
+
+    if (value && typeof value === "object") {
+      const objectValue = value as Record<string, unknown>;
+      const nestedText =
+        objectValue.choice ?? objectValue.text ?? objectValue.value;
+
+      if (typeof nestedText === "string") {
+        return nestedText.trim().length > 0 ? nestedText : null;
+      }
+      if (typeof nestedText === "number" || typeof nestedText === "boolean") {
+        return String(nestedText);
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Batch detect languages for multiple texts using CLD first, falling back to GPT-5-nano
+   */
+  async batchGetLanguageCodes(
+    texts: string[],
+    assignmentId = 1,
+  ): Promise<string[]> {
+    if (texts.length === 0) return [];
+
+    const results: unknown[] = Array.from({ length: texts.length }).fill(
+      "unknown",
+    );
+    const textsNeedingGPT: Array<{ text: string; index: number }> = [];
+
+    for (const [index, text] of texts.entries()) {
+      if (!text || !text.trim()) continue;
+      const decodedText = decodeIfBase64(text) || text;
+      textsNeedingGPT.push({
+        text: decodedText.slice(0, 500),
+        index,
+      });
+    }
+
+    if (
+      textsNeedingGPT.length === 0 &&
+      results.every((r) => typeof r === "string")
+    ) {
+      return results;
+    }
+
+    this.logger.debug(
+      `Using GPT-5-nano to detect ${textsNeedingGPT.length}/${texts.length} texts`,
+    );
+
+    const parser = StructuredOutputParser.fromZodSchema(
+      z.object({
+        detections: z.array(
+          z.object({
+            textIndex: z
+              .number()
+              .describe("The index of the text in the input array"),
+            languageCode: z
+              .string()
+              .describe("The detected language code (e.g., 'en', 'es', 'fr')"),
+            confidence: z
+              .number()
+              .min(0)
+              .max(1)
+              .describe("Confidence score between 0 and 1"),
+          }),
+        ),
+      }),
+    );
+
+    const formatInstructions = parser.getFormatInstructions();
+
+    const inputTexts = textsNeedingGPT
+      .map((item, index) => `Text ${index}: ${item.text}`)
+      .join("\n\n");
+
+    const prompt = new PromptTemplate({
+      template: `You are a language detection expert. Analyze the following texts and identify their languages.
+
+TEXTS TO ANALYZE:
+{texts}
+
+INSTRUCTIONS:
+1. For each text, detect its language
+2. Return the standard ISO 639-1 language code (e.g., 'en' for English, 'es' for Spanish)
+3. For Chinese, specify 'zh-CN' for simplified or 'zh-TW' for traditional
+4. If you cannot determine the language, return 'unknown' as the language code
+5. Provide a confidence score between 0 and 1 for each detection
+6. Return results for all texts in the order they appear (Text 0, Text 1, etc.)
+
+{format_instructions}`,
+      inputVariables: [],
+      partialVariables: {
+        texts: inputTexts,
+        format_instructions: formatInstructions,
+      },
+    });
+
+    try {
+      const response = await this.promptProcessor.processPromptForFeature(
+        prompt,
+        assignmentId,
+        AIUsageType.TRANSLATION,
+        "translation",
+        "gpt-5-nano",
+        TranslationService.LLM_CALL_OPTIONS,
+      );
+
+      const parsedResponse = await parser.parse(response);
+
+      for (const detection of parsedResponse.detections) {
+        const gptTextItem = textsNeedingGPT[detection.textIndex];
+        if (gptTextItem) {
+          results[gptTextItem.index] = detection.languageCode;
+
+          this.logger.debug(
+            `GPT-5-nano batch detected language for text ${gptTextItem.index}: ${detection.languageCode} (${detection.confidence} confidence)`,
+          );
+
+          if (detection.confidence < 0.5) {
+            this.logger.warn(
+              `Low confidence (${detection.confidence}) in GPT-5-nano batch language detection for text at index ${gptTextItem.index}`,
+            );
+          }
+        }
+      }
+
+      if (results.every((r) => typeof r === "string")) {
+        return results;
+      }
+    } catch (error) {
+      this.logger.error(
+        `Error in batch language detection with GPT-5-nano: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+      );
+      return Promise.all(
+        texts.map((text) => this.getLanguageCode(text, assignmentId)),
+      );
+    }
+  }
+
+  /**
+   * Detect the language of text using GPT-5-nano
+   */
+  async getLanguageCode(text: string, assignmentId = 1): Promise<string> {
+    if (!text) return "unknown";
+
+    const decodedText = decodeIfBase64(text) || text;
+
+    const textSample = decodedText.slice(0, 500);
+
+    const parser = StructuredOutputParser.fromZodSchema(
+      z.object({
+        languageCode: z
+          .string()
+          .describe(
+            "The detected language code (e.g., 'en', 'es', 'fr', 'zh-CN')",
+          ),
+        confidence: z
+          .number()
+          .min(0)
+          .max(1)
+          .describe("Confidence score between 0 and 1"),
+      }),
+    );
+
+    const formatInstructions = parser.getFormatInstructions();
+
+    const prompt = new PromptTemplate({
+      template: `You are a language detection expert. Analyze the following text and identify its language.
+
+TEXT:
+{text}
+
+INSTRUCTIONS:
+1. Detect the language of the text
+2. Return the standard ISO 639-1 language code (e.g., 'en' for English, 'es' for Spanish)
+3. For Chinese, specify 'zh-CN' for simplified or 'zh-TW' for traditional
+4. If you cannot determine the language, return 'unknown' as the language code
+5. Provide a confidence score between 0 and 1
+
+{format_instructions}`,
+      inputVariables: [],
+      partialVariables: {
+        text: textSample,
+        format_instructions: formatInstructions,
+      },
+    });
+
+    try {
+      const response = await this.promptProcessor.processPromptForFeature(
+        prompt,
+        assignmentId,
+        AIUsageType.TRANSLATION,
+        "translation",
+        "gpt-5-nano",
+        TranslationService.LLM_CALL_OPTIONS,
+      );
+
+      const parsedResponse = await parser.parse(response);
+
+      this.logger.debug(
+        `GPT-5-nano detected language: ${parsedResponse.languageCode} (${parsedResponse.confidence} confidence)`,
+      );
+
+      if (parsedResponse.confidence < 0.5) {
+        this.logger.warn(
+          `Low confidence (${
+            parsedResponse.confidence
+          }) in GPT-5-nano language detection for: "${textSample.slice(
+            0,
+            50,
+          )}..."`,
+        );
+      }
+
+      return parsedResponse.languageCode;
+    } catch (error) {
+      this.logger.error(
+        `Error detecting language with GPT-5-nano: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+      );
+      return "unknown";
+    }
+  }
+
+  /**
+   * Translate a question to a target language
+   */
+  async generateQuestionTranslation(
+    assignmentId: number,
+    questionText: string,
+    targetLanguage: string,
+  ): Promise<string> {
+    const decodedQuestionText = decodeIfBase64(questionText) || questionText;
+
+    const { preparedText, placeholders } =
+      prepareHtmlForTranslation(decodedQuestionText);
+
+    const targetLanguageName = this.getLanguageName(targetLanguage);
+
+    const parser = StructuredOutputParser.fromZodSchema(
+      z.object({
+        translatedText: z.string().nonempty("Translated text cannot be empty"),
+      }),
+    );
+
+    const formatInstructions = parser.getFormatInstructions();
+
+    const prompt = new PromptTemplate({
+      template: this.getQuestionTranslationTemplate(),
+      inputVariables: [],
+      partialVariables: {
+        question_text: preparedText,
+        target_language: targetLanguageName,
+        format_instructions: formatInstructions,
+      },
+    });
+
+    try {
+      const response = await this.promptProcessor.processPromptForFeature(
+        prompt,
+        assignmentId,
+        AIUsageType.TRANSLATION,
+        "translation",
+        "gpt-4o-mini",
+        TranslationService.LLM_CALL_OPTIONS,
+      );
+
+      try {
+        const parsedResponse = await parser.parse(response);
+        return this.finalizeQuestionTranslation(
+          parsedResponse.translatedText,
+          preparedText,
+          placeholders,
+          targetLanguage,
+        );
+      } catch (parseError) {
+        this.logger.warn(
+          `Structured parse failed for question translation, falling back to plain text: ${
+            parseError instanceof Error
+              ? parseError.message
+              : String(parseError)
+          }`,
+        );
+
+        const fallbackPrompt = new PromptTemplate({
+          template:
+            `Translate the following question into {target_language}.\n` +
+            `The question may contain HTML. Keep every tag and attribute exactly as written, ` +
+            `in the same order, and translate only the text between the tags.\n` +
+            `Preserve any placeholders like [[IMAGE_0]] exactly as written.\n` +
+            `Return ONLY the translated text. No quotes, no JSON, no markdown, no explanations.\n\n` +
+            `QUESTION:\n{question_text}`,
+          inputVariables: [],
+          partialVariables: {
+            question_text: preparedText,
+            target_language: targetLanguageName,
+          },
+        });
+
+        const plain = await this.promptProcessor.processPrompt(
+          fallbackPrompt,
+          assignmentId,
+          AIUsageType.TRANSLATION,
+          "gpt-4o-mini",
+          TranslationService.LLM_CALL_OPTIONS,
+        );
+        return this.finalizeQuestionTranslation(
+          plain?.trim?.() ?? plain,
+          preparedText,
+          placeholders,
+          targetLanguage,
+        );
+      }
+    } catch (error) {
+      this.logger.error(
+        `Error translating question: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+      );
+      throw new HttpException(
+        "Failed to translate question",
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+  /**
+   * Generate comprehensive translations for choice objects including feedback
+   * Validates existing translations and retranslates if language doesn't match
+   *
+   * @param choices - Original choices array to translate
+   * @param assignmentId - The assignment ID for tracking
+   * @param targetLanguage - The target language code
+   * @returns Translated choices with both choice text and feedback translated and validated
+   */
+  async generateChoicesTranslation(
+    choices: Choice[] | null | undefined | string | any,
+    assignmentId: number,
+    targetLanguage: string,
+  ): Promise<Choice[] | null | undefined> {
+    let parsedChoices: Choice[] | null = null;
+
+    if (!choices) {
+      this.logger.debug("No choices provided for translation");
+      return null;
+    }
+
+    if (typeof choices === "string") {
+      try {
+        parsedChoices = JSON.parse(choices) as Choice[];
+        this.logger.debug(
+          `Parsed choices from JSON string: ${parsedChoices.length} choices`,
+        );
+      } catch (error) {
+        this.logger.error(`Failed to parse choices JSON: ${String(error)}`);
+        return null;
+      }
+    } else if (Array.isArray(choices)) {
+      parsedChoices = choices as Choice[];
+    } else {
+      this.logger.debug(
+        `No choices to translate or choices is not an array: ${typeof choices}`,
+      );
+      return null;
+    }
+
+    if (
+      !parsedChoices ||
+      !Array.isArray(parsedChoices) ||
+      parsedChoices.length === 0
+    ) {
+      this.logger.debug("No valid choices to translate after parsing");
+      return parsedChoices;
+    }
+
+    try {
+      this.logger.debug(
+        `Batch translating text for ${parsedChoices.length} choices to ${targetLanguage}`,
+      );
+
+      const textsToCheck: string[] = [];
+      const textMap: Array<{
+        choiceIndex: number;
+        type: "choice" | "feedback";
+        textIndex: number;
+        sourceText: string;
+      }> = [];
+
+      for (const [choiceIndex, choice] of parsedChoices.entries()) {
+        const normalizedChoiceText = this.normalizeTranslatableText(
+          choice.choice,
+        );
+        if (normalizedChoiceText) {
+          textMap.push({
+            choiceIndex,
+            type: "choice",
+            textIndex: textsToCheck.length,
+            sourceText: normalizedChoiceText,
+          });
+          textsToCheck.push(normalizedChoiceText);
+        }
+
+        const normalizedFeedbackText = this.normalizeTranslatableText(
+          choice.feedback,
+        );
+        if (normalizedFeedbackText) {
+          textMap.push({
+            choiceIndex,
+            type: "feedback",
+            textIndex: textsToCheck.length,
+            sourceText: normalizedFeedbackText,
+          });
+          textsToCheck.push(normalizedFeedbackText);
+        }
+      }
+
+      let needsTranslationFlags: boolean[] = [];
+      if (textsToCheck.length > 0) {
+        needsTranslationFlags = await this.batchShouldRetranslate(
+          textsToCheck,
+          targetLanguage,
+          assignmentId,
+        );
+      }
+
+      const translatedChoices = await Promise.all(
+        parsedChoices.map(async (choice, choiceIndex) => {
+          const translatedChoice = { ...choice };
+
+          const choiceMapping = textMap.find(
+            (m) => m.choiceIndex === choiceIndex && m.type === "choice",
+          );
+          if (choiceMapping && needsTranslationFlags[choiceMapping.textIndex]) {
+            try {
+              const translatedText = await this.translateText(
+                choiceMapping.sourceText,
+                targetLanguage,
+                assignmentId,
+              );
+              translatedChoice.choice = translatedText;
+              this.logger.debug(
+                `Batch retranslated choice text to ${targetLanguage}`,
+              );
+            } catch (error) {
+              this.logger.error(
+                `Failed to translate choice text: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              );
+            }
+          }
+
+          const feedbackMapping = textMap.find(
+            (m) => m.choiceIndex === choiceIndex && m.type === "feedback",
+          );
+          if (
+            feedbackMapping &&
+            needsTranslationFlags[feedbackMapping.textIndex]
+          ) {
+            try {
+              const translatedFeedback = await this.translateText(
+                feedbackMapping.sourceText,
+                targetLanguage,
+                assignmentId,
+              );
+              translatedChoice.feedback = translatedFeedback;
+              this.logger.debug(
+                `Batch retranslated choice feedback to ${targetLanguage}`,
+              );
+            } catch (error) {
+              this.logger.error(
+                `Failed to translate choice feedback: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              );
+            }
+          }
+
+          return translatedChoice;
+        }),
+      );
+
+      return translatedChoices;
+    } catch (error) {
+      this.logger.error(
+        `Error translating choice text: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+
+      return parsedChoices;
+    }
+  }
+
+  /**
+   * Batch determine if texts should be retranslated based on language detection
+   *
+   * @param texts - Array of texts to check
+   * @param targetLanguage - The expected target language code
+   * @param assignmentId - The assignment ID for tracking
+   * @returns Promise<boolean[]> - array of booleans indicating which texts need retranslation
+   */
+  private async batchShouldRetranslate(
+    texts: string[],
+    targetLanguage: string,
+    assignmentId: number,
+  ): Promise<boolean[]> {
+    if (texts.length === 0) return [];
+
+    const validTexts = texts.filter(
+      (text) => typeof text === "string" && text.trim().length > 0,
+    );
+    if (validTexts.length === 0) {
+      return texts.map(() => false);
+    }
+
+    try {
+      const detectedLanguages = await this.batchGetLanguageCodes(
+        texts,
+        assignmentId,
+      );
+
+      return texts.map((text, index) => {
+        if (typeof text !== "string" || text.trim().length === 0) {
+          return false;
+        }
+
+        const detectedLanguage = detectedLanguages[index];
+
+        if (detectedLanguage === "unknown") {
+          this.logger.debug(
+            `Could not detect language for text, skipping validation: "${text.slice(
+              0,
+              50,
+            )}..."`,
+          );
+          return false;
+        }
+
+        const normalizedDetected = this.normalizeLanguageCode(detectedLanguage);
+        const normalizedTarget = this.normalizeLanguageCode(targetLanguage);
+
+        const needsRetranslation = normalizedDetected !== normalizedTarget;
+
+        if (needsRetranslation) {
+          this.logger.info(
+            `Language mismatch detected in batch. Expected: ${normalizedTarget}, Found: ${normalizedDetected}. Text: "${text.slice(
+              0,
+              50,
+            )}..."`,
+          );
+        }
+
+        return needsRetranslation;
+      });
+    } catch (error) {
+      this.logger.error(
+        `Error during batch language validation: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return Promise.all(
+        texts.map((text) =>
+          this.shouldRetranslate(text, targetLanguage, assignmentId),
+        ),
+      );
+    }
+  }
+
+  /**
+   * Determine if text should be retranslated based on language detection
+   *
+   * @param text - The text to check
+   * @param targetLanguage - The expected target language code
+   * @param assignmentId - The assignment ID for tracking
+   * @returns Promise<boolean> - true if text needs retranslation
+   */
+  private async shouldRetranslate(
+    text: string,
+    targetLanguage: string,
+    assignmentId: number,
+  ): Promise<boolean> {
+    if (!text || text.trim().length === 0) {
+      return false;
+    }
+
+    try {
+      const detectedLanguage = await this.getLanguageCode(text, assignmentId);
+
+      if (detectedLanguage === "unknown") {
+        this.logger.debug(
+          `Could not detect language for text, skipping validation: "${text.slice(
+            0,
+            50,
+          )}..."`,
+        );
+        return false;
+      }
+
+      const normalizedDetected = this.normalizeLanguageCode(detectedLanguage);
+      const normalizedTarget = this.normalizeLanguageCode(targetLanguage);
+
+      const needsRetranslation = normalizedDetected !== normalizedTarget;
+
+      if (needsRetranslation) {
+        this.logger.info(
+          `Language mismatch detected. Expected: ${normalizedTarget}, Found: ${normalizedDetected}. Text: "${text.slice(
+            0,
+            50,
+          )}..."`,
+        );
+      } else {
+        this.logger.debug(`Text language matches target: ${normalizedTarget}`);
+      }
+
+      return needsRetranslation;
+    } catch (error) {
+      this.logger.error(
+        `Error during language validation: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return true;
+    }
+  }
+
+  /**
+   * Normalize language codes for comparison (handles variants like zh-CN vs zh)
+   *
+   * @param languageCode - The language code to normalize
+   * @returns string - The normalized language code
+   */
+  private normalizeLanguageCode(languageCode: string): string {
+    if (!languageCode) return "unknown";
+
+    const code = languageCode.toLowerCase();
+
+    const languageMap: Record<string, string> = {
+      "zh-cn": "zh",
+      "zh-tw": "zh",
+      "zh-hk": "zh",
+      "en-us": "en",
+      "en-gb": "en",
+      "en-ca": "en",
+      "es-es": "es",
+      "es-mx": "es",
+      "pt-br": "pt",
+      "pt-pt": "pt",
+      "fr-fr": "fr",
+      "fr-ca": "fr",
+      "de-de": "de",
+      "it-it": "it",
+      "ru-ru": "ru",
+      "ja-jp": "ja",
+      "ko-kr": "ko",
+    };
+
+    return languageMap[code] || code.split("-")[0];
+  }
+
+  /**
+   * Translate arbitrary text to a target language
+   */
+  async translateText(
+    text: string,
+    targetLanguage: string,
+    assignmentId: number,
+  ): Promise<string> {
+    const normalizedInput = this.normalizeTranslatableText(text);
+    if (!normalizedInput) return "";
+
+    const decodedText = decodeIfBase64(normalizedInput) || normalizedInput;
+
+    const targetLanguageName = this.getLanguageName(targetLanguage);
+
+    const parser = StructuredOutputParser.fromZodSchema(
+      z.object({
+        translatedText: z.string().nonempty("Translated text cannot be empty"),
+      }),
+    );
+
+    const formatInstructions = parser.getFormatInstructions();
+
+    const prompt = new PromptTemplate({
+      template: this.getGeneralTranslationTemplate(),
+      inputVariables: [],
+      partialVariables: {
+        text: decodedText,
+        target_language: targetLanguageName,
+        format_instructions: formatInstructions,
+      },
+    });
+
+    try {
+      const response = await this.promptProcessor.processPromptForFeature(
+        prompt,
+        assignmentId,
+        AIUsageType.TRANSLATION,
+        "translation",
+        "gpt-4o-mini",
+        TranslationService.LLM_CALL_OPTIONS,
+      );
+
+      try {
+        const parsedResponse = await parser.parse(response);
+        return parsedResponse.translatedText;
+      } catch (parseError) {
+        this.logger.warn(
+          `Structured parse failed for text translation, falling back to plain text: ${
+            parseError instanceof Error
+              ? parseError.message
+              : String(parseError)
+          }`,
+        );
+
+        const fallbackPrompt = new PromptTemplate({
+          template:
+            `Translate the following text into {target_language}.\n` +
+            `Return ONLY the translated text. No quotes, no JSON, no markdown, no explanations.\n\n` +
+            `TEXT:\n{text}`,
+          inputVariables: [],
+          partialVariables: {
+            text: decodedText,
+            target_language: targetLanguageName,
+          },
+        });
+
+        const plain = await this.promptProcessor.processPrompt(
+          fallbackPrompt,
+          assignmentId,
+          AIUsageType.TRANSLATION,
+          "gpt-4o-mini",
+          TranslationService.LLM_CALL_OPTIONS,
+        );
+        return plain?.trim?.() ?? plain;
+      }
+    } catch (error) {
+      this.logger.error(
+        `Error translating text: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+      );
+      throw new HttpException(
+        "Failed to translate text",
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  private getQuestionTranslationTemplate(): string {
+    return `
+    You are a professional translator with expertise in educational content. Translate the following question into {target_language}:
+    
+    QUESTION:
+    {question_text}
+    
+    TRANSLATION INSTRUCTIONS:
+    1. Maintain the original meaning, context, and intent of the question.
+    2. Adapt any idiomatic expressions or culture-specific references appropriately.
+    3. Ensure the translation is natural and fluent in the target language.
+    4. The question may contain HTML. Reproduce every tag and attribute exactly as written, in the same order and nesting, and translate only the text between the tags. Never add, drop or reorder tags, and never translate attribute values such as href, class or data-list.
+    5. Preserve formatting elements such as bullet points or numbered lists.
+    6. Translate any proper names only if they have standard translations in the target language.
+    7. Preserve any words already in another language—tech terms, proper names, acronyms, quotes—exactly as written.
+    8. Preserve placeholder tokens like [[IMAGE_0]] exactly as written and keep their position.
+    
+    {format_instructions}
+    `;
+  }
+
+  /**
+   * Sanitize the model's translation, put the images back, and flag the case
+   * where the translation came back as plain text even though the source was
+   * formatted — the learner would get one unbroken paragraph, with any link
+   * targets gone.
+   *
+   * @param translatedText - Raw text returned by the model
+   * @param preparedText - The sanitized source that was sent to the model
+   * @param placeholders - Image tags removed before prompting
+   * @param targetLanguage - Language the question was translated into
+   * @returns Storable translated HTML
+   */
+  private finalizeQuestionTranslation(
+    translatedText: string,
+    preparedText: string,
+    placeholders: string[],
+    targetLanguage: string,
+  ): string {
+    const restored = restoreTranslatedHtml(translatedText, placeholders);
+
+    if (hasLostMarkup(preparedText, restored)) {
+      this.logger.warn(
+        `Question translation to ${targetLanguage} came back without the formatting of its source; ` +
+          `the learner will see unformatted text`,
+      );
+    }
+
+    return restored;
+  }
+
+  private getChoicesTranslationTemplate(): string {
+    return `
+    You are a professional translator with expertise in educational content. Translate the following multiple-choice options into {target_language}:
+    
+    CHOICES:
+    {choices_json}
+    
+    TRANSLATION INSTRUCTIONS:
+    1. Maintain the original meaning, context, and correctness of each choice.
+    2. Ensure the translations are natural and fluent in the target language.
+    3. Preserve any formatting in the choices.
+    4. Do not change which choice is marked as correct.
+    5. Translate any proper names only if they have standard translations in the target language.
+    
+    {format_instructions}
+    `;
+  }
+
+  private getGeneralTranslationTemplate(): string {
+    return `
+    You are translating educational content for students and teachers, ensuring clarity and an appropriate academic tone.
+    
+    TEXT TO TRANSLATE:
+    {text}
+    
+    TARGET LANGUAGE:
+    {target_language}
+    
+    TRANSLATION INSTRUCTIONS:
+    1. Maintain the original meaning, context, and intent.
+    2. Ensure the translation is natural and fluent in the target language.
+    3. Preserve any formatting elements such as bullet points or numbered lists.
+    4. Adapt any idiomatic expressions or culture-specific references appropriately.
+    5. Translate any proper names only if they have standard translations in the target language.
+    6. Preserve any words already in another language—tech terms, proper names, acronyms, quotes—exactly as written.
+
+    {format_instructions}
+    `;
+  }
+}

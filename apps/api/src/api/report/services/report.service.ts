@@ -1,0 +1,2805 @@
+/* eslint-disable @typescript-eslint/no-unsafe-member-access */
+/* eslint-disable @typescript-eslint/no-unsafe-assignment */
+/* eslint-disable unicorn/no-null */
+import {
+  BadRequestException,
+  HttpException,
+  HttpStatus,
+  Injectable,
+  InternalServerErrorException,
+  Logger,
+  NotFoundException,
+} from "@nestjs/common";
+import { createHash, randomBytes } from "node:crypto";
+import { Prisma, ReportStatus, ReportType } from "@prisma/client";
+import axios from "axios";
+import * as jwt from "jsonwebtoken";
+import * as natural from "natural";
+import { FilesService } from "src/api/files/services/files.service";
+import {
+  UserRole,
+  UserSession,
+} from "src/auth/interfaces/user.session.interface";
+import { AdminEmailService } from "src/auth/services/admin-email.service";
+import { PrismaService } from "src/database/prisma.service";
+import {
+  buildSnSupportTicketTitle,
+  defaultSeverityForIssueType,
+  stripSectionLabelMarkdown,
+} from "../helpers/issue-template";
+import {
+  ReportDiagnostics,
+  summarizeReportDiagnostics,
+} from "../helpers/report-diagnostics";
+import { BugRenewalEmailDto, ReportIssueDto } from "../types/report.types";
+import { FloService } from "./flo.service";
+import { SnSupportService } from "./sn-support.service";
+import { SupportRoutingService } from "./support-routing.service";
+
+interface FeedbackFilterParameters {
+  page: number;
+  limit: number;
+  search?: string;
+  assignmentId?: number;
+  allowContact?: boolean;
+  startDate?: string;
+  endDate?: string;
+  userSession?: UserSession;
+}
+
+interface ReportFilterParameters {
+  page: number;
+  limit: number;
+  search?: string;
+  assignmentId?: number;
+  status?: string;
+  issueType?: string;
+  startDate?: string;
+  endDate?: string;
+}
+@Injectable()
+export class ReportsService {
+  private ghTokenCache: { value: string; expiresAt: number } | null = null;
+  private ghInstallationIdCache: number | null = null;
+  private readonly logger = new Logger(ReportsService.name);
+
+  constructor(
+    private readonly floService: FloService,
+    private readonly prisma: PrismaService,
+    private readonly filesService: FilesService,
+    private readonly adminEmailService: AdminEmailService,
+    private readonly snSupportService: SnSupportService,
+    private readonly supportRouting: SupportRoutingService,
+  ) {}
+
+  private async getGithubConfig(
+    logContext: string,
+    extraFields: Record<string, unknown> = {},
+  ): Promise<{ githubOwner: string; githubRepo: string; token: string }> {
+    const githubOwner = process.env.GITHUB_OWNER;
+    const githubRepo = process.env.GITHUB_REPO;
+    const token = await this.getInstallationToken();
+    if (!githubOwner || !githubRepo || !token) {
+      this.logger.error(`${logContext}: GitHub config or token missing`, {
+        ...extraFields,
+        owner_set: !!githubOwner,
+        repo_set: !!githubRepo,
+        token_set: !!token,
+      });
+      throw new InternalServerErrorException(
+        "GitHub repository configuration or token missing",
+      );
+    }
+    return { githubOwner, githubRepo, token };
+  }
+
+  private async fetchGitHubIssueComments(issueNumber: number): Promise<
+    Array<{
+      id: number;
+      body: string;
+      created_at: string;
+      author: string;
+      url: string;
+    }>
+  > {
+    const { githubOwner, githubRepo, token } = await this.getGithubConfig(
+      "fetchGitHubIssueComments",
+      { issueNumber },
+    );
+
+    const commentsResponse = await axios.get(
+      `https://api.github.com/repos/${githubOwner}/${githubRepo}/issues/${issueNumber}/comments`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+      },
+    );
+
+    const comments = commentsResponse.data as Array<{
+      id: number;
+      body: string;
+      created_at: string;
+      user: { login: string };
+      html_url: string;
+    }>;
+
+    return comments.map((c) => ({
+      id: c.id,
+      body: c.body,
+      created_at: c.created_at,
+      author: c.user?.login ?? "unknown",
+      url: c.html_url,
+    }));
+  }
+
+  private getDeveloperNotificationEmail(): string | undefined {
+    return (
+      process.env.GITHUB_DEV_EMAIL ||
+      process.env.REPORTS_DEV_EMAIL ||
+      process.env.SUPPORT_EMAIL
+    );
+  }
+
+  private async sendReportEmail(
+    to: string | undefined,
+    subject: string,
+    body: string,
+  ) {
+    if (!to) return;
+    await this.adminEmailService.sendGenericEmail(to, subject, body);
+  }
+
+  private getRenewalTokenTtlSeconds(): number {
+    return 7 * 24 * 60 * 60;
+  }
+
+  private getRenewalBaseUrl(): string {
+    if (process.env.NODE_ENV === "production") {
+      if (!process.env.WEB_APP_URL) {
+        this.logger.error(
+          "getRenewalBaseUrl: WEB_APP_URL env var missing in production",
+        );
+        throw new InternalServerErrorException("WEB_APP_URL missing");
+      }
+      return process.env.WEB_APP_URL;
+    }
+    if (process.env.NODE_ENV === "staging") {
+      return (
+        process.env.STAGING_WEB_APP_URL ||
+        process.env.WEB_APP_URL ||
+        "http://localhost:3010"
+      );
+    }
+    return process.env.WEB_APP_URL || "http://localhost:3010";
+  }
+
+  private buildRenewalActionLink(action: "renew" | "close", token: string) {
+    const baseUrl = this.getRenewalBaseUrl();
+    return `${baseUrl}/api/v1/reports/renewal-action?action=${action}&token=${encodeURIComponent(
+      token,
+    )}`;
+  }
+
+  private generateRenewalToken(): string {
+    return randomBytes(32).toString("base64url");
+  }
+
+  private hashRenewalToken(token: string): string {
+    return createHash("sha256").update(token).digest("hex");
+  }
+
+  private truncateText(text: string, maxLength: number) {
+    if (text.length <= maxLength) return text;
+    return `${text.slice(0, maxLength - 3)}...`;
+  }
+
+  private extractDevelopmentDetails(text: string): string {
+    const marker = "Development details:";
+    const index = text.indexOf(marker);
+    if (index === -1) {
+      return this.stripRepro(text.trim());
+    }
+    return this.stripRepro(text.slice(index + marker.length).trim());
+  }
+
+  private stripRepro(text: string): string {
+    const reproMarker = "Steps to reproduce:";
+    const reproIndex = text.indexOf(reproMarker);
+    if (reproIndex === -1) return text;
+    return text.slice(0, reproIndex).trim();
+  }
+
+  private async postGithubComment(issueNumber: number, body: string) {
+    const { githubOwner, githubRepo, token } = await this.getGithubConfig(
+      "postGithubComment",
+      { issueNumber, body_length: body?.length },
+    );
+
+    await axios.post(
+      `https://api.github.com/repos/${githubOwner}/${githubRepo}/issues/${issueNumber}/comments`,
+      { body },
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+      },
+    );
+  }
+
+  async handleIncomingGitHubComment(
+    issueNumber: number,
+    commentBody: string,
+    commenter: string,
+  ) {
+    const report = await this.prisma.report.findFirst({
+      where: { issueNumber },
+    });
+    if (!report) return;
+
+    if (report.reporterId && commenter && commenter === report.reporterId) {
+      return;
+    }
+
+    await this.prisma.report.update({
+      where: { id: report.id },
+      data: {
+        comments: commentBody,
+        updatedAt: new Date(),
+        ...(report.status === ReportStatus.OPEN
+          ? {
+              status: ReportStatus.IN_PROGRESS,
+              statusMessage: "Developer is investigating your report",
+            }
+          : {}),
+      },
+    });
+
+    await this.sendReportEmail(
+      report.reporterId || undefined,
+      `Update on your report #${report.issueNumber ?? report.id}`,
+      `New developer comment (${commenter}):\n\n${commentBody}`,
+    );
+  }
+  private getPrivateKey(): string {
+    const raw = process.env.GITHUB_APP_PRIVATE_KEY || "";
+
+    let processed = raw.trim();
+
+    if (processed.includes("\\n")) {
+      processed = processed.replaceAll("\\n", "\n");
+    }
+
+    if (!processed.startsWith("-----BEGIN")) {
+      this.logger.error(
+        "getPrivateKey: GITHUB_APP_PRIVATE_KEY missing BEGIN marker",
+        { raw_length: raw.length, processed_length: processed.length },
+      );
+      throw new InternalServerErrorException(
+        "Invalid private key format: missing BEGIN marker",
+      );
+    }
+    if (!processed.endsWith("-----")) {
+      this.logger.error(
+        "getPrivateKey: GITHUB_APP_PRIVATE_KEY missing END marker",
+        { raw_length: raw.length, processed_length: processed.length },
+      );
+      throw new InternalServerErrorException(
+        "Invalid private key format: missing END marker",
+      );
+    }
+
+    return processed;
+  }
+
+  private buildAppJWT(): string {
+    const appId = process.env.GITHUB_APP_ID;
+    if (!appId) {
+      this.logger.error("buildAppJWT: GITHUB_APP_ID env var missing");
+      throw new InternalServerErrorException("GITHUB_APP_ID missing");
+    }
+    const privateKey = this.getPrivateKey();
+    const now = Math.floor(Date.now() / 1000);
+
+    try {
+      const token = jwt.sign(
+        {
+          iat: now - 60,
+          exp: now + 9 * 60,
+          iss: appId,
+        },
+        privateKey,
+        { algorithm: "RS256" },
+      );
+
+      return token;
+    } catch (error) {
+      this.logger.error("buildAppJWT: jwt.sign failed", {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      throw new InternalServerErrorException("Failed to create GitHub App JWT");
+    }
+  }
+
+  private async getInstallationId(): Promise<number> {
+    if (this.ghInstallationIdCache) return this.ghInstallationIdCache;
+
+    const explicit = process.env.GITHUB_APP_INSTALLATION_ID;
+    if (explicit) {
+      this.ghInstallationIdCache = Number(explicit);
+      return this.ghInstallationIdCache;
+    }
+
+    const owner = process.env.GITHUB_OWNER;
+    const repo = process.env.GITHUB_REPO;
+    if (!owner || !repo) {
+      this.logger.error(
+        "getInstallationId: GITHUB_OWNER or GITHUB_REPO missing",
+        { owner_set: !!owner, repo_set: !!repo },
+      );
+      throw new InternalServerErrorException(
+        "GITHUB_OWNER or GITHUB_REPO missing",
+      );
+    }
+
+    try {
+      const appJwt = this.buildAppJWT();
+
+      const { data } = await axios.get(
+        `https://api.github.com/repos/${owner}/${repo}/installation`,
+        {
+          headers: {
+            Authorization: `Bearer ${appJwt}`,
+            Accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+          },
+        },
+      );
+      this.ghInstallationIdCache = Number(data.id);
+      return this.ghInstallationIdCache;
+    } catch (error) {
+      const message = axios.isAxiosError(error)
+        ? error.message
+        : "Failed to get GitHub App installation ID";
+      this.logger.error("getInstallationId: GitHub App API call failed", {
+        is_axios: axios.isAxiosError(error),
+        axios_status: axios.isAxiosError(error)
+          ? error.response?.status
+          : undefined,
+        axios_url: axios.isAxiosError(error) ? error.config?.url : undefined,
+        message,
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      throw new InternalServerErrorException(message, {
+        cause: error instanceof Error ? error : undefined,
+      });
+    }
+  }
+  private async getInstallationToken(): Promise<string> {
+    const now = Math.floor(Date.now() / 1000);
+
+    if (this.ghTokenCache && this.ghTokenCache.expiresAt - 60 > now) {
+      return this.ghTokenCache.value;
+    }
+
+    try {
+      const installationId = await this.getInstallationId();
+      const appJwt = this.buildAppJWT();
+
+      const { data } = await axios.post(
+        `https://api.github.com/app/installations/${installationId}/access_tokens`,
+        {},
+        {
+          headers: {
+            Authorization: `Bearer ${appJwt}`,
+            Accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+          },
+        },
+      );
+
+      const token = String(data.token);
+      const expiresAt = Math.floor(
+        new Date(String(data.expires_at)).getTime() / 1000,
+      );
+      this.ghTokenCache = { value: token, expiresAt };
+      return token;
+    } catch (error) {
+      const message = axios.isAxiosError(error)
+        ? error.message
+        : "Failed to get GitHub App installation token";
+      this.logger.error(
+        "getInstallationToken: GitHub access token request failed",
+        {
+          is_axios: axios.isAxiosError(error),
+          axios_status: axios.isAxiosError(error)
+            ? error.response?.status
+            : undefined,
+          axios_url: axios.isAxiosError(error) ? error.config?.url : undefined,
+          message,
+          stack: error instanceof Error ? error.stack : undefined,
+        },
+      );
+      throw new InternalServerErrorException(message, {
+        cause: error instanceof Error ? error : undefined,
+      });
+    }
+  }
+
+  async getFeedback(parameters: FeedbackFilterParameters) {
+    const {
+      page,
+      limit,
+      search,
+      assignmentId,
+      allowContact,
+      startDate,
+      endDate,
+      userSession,
+    } = parameters;
+    const skip = (page - 1) * limit;
+
+    const where: Prisma.AssignmentFeedbackWhereInput = {};
+
+    if (userSession && userSession.role === UserRole.AUTHOR) {
+      where.assignment = {
+        AssignmentAuthor: {
+          some: {
+            userId: userSession.userId,
+          },
+        },
+      };
+    }
+
+    if (assignmentId) {
+      where.assignmentId = assignmentId;
+    }
+
+    if (allowContact !== undefined) {
+      where.allowContact = allowContact;
+    }
+
+    if (search) {
+      where.OR = [
+        { comments: { contains: search } },
+        { firstName: { contains: search } },
+        { lastName: { contains: search } },
+        { email: { contains: search } },
+      ];
+    }
+
+    if (startDate || endDate) {
+      where.createdAt = {};
+      if (startDate) {
+        where.createdAt.gte = new Date(startDate);
+      }
+      if (endDate) {
+        where.createdAt.lte = new Date(endDate);
+      }
+    }
+
+    const [data, total] = await Promise.all([
+      this.prisma.assignmentFeedback.findMany({
+        where,
+        skip,
+        take: limit,
+        include: {
+          assignment: {
+            select: {
+              id: true,
+              name: true,
+            },
+          },
+          assignmentAttempt: {
+            select: {
+              id: true,
+              grade: true,
+              submitted: true,
+            },
+          },
+        },
+        orderBy: {
+          createdAt: "desc",
+        },
+      }),
+      this.prisma.assignmentFeedback.count({ where }),
+    ]);
+
+    return {
+      data,
+      pagination: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
+
+  async getReports(parameters: ReportFilterParameters) {
+    const {
+      page,
+      limit,
+      search,
+      assignmentId,
+      status,
+      issueType,
+      startDate,
+      endDate,
+    } = parameters;
+    const skip = (page - 1) * limit;
+
+    const where: Prisma.ReportWhereInput = {};
+
+    if (assignmentId) {
+      where.assignmentId = assignmentId;
+    }
+
+    if (status) {
+      where.status = status as unknown;
+    }
+
+    if (issueType) {
+      where.issueType = issueType as unknown;
+    }
+
+    if (search) {
+      where.OR = [
+        { description: { contains: search } },
+        { statusMessage: { contains: search } },
+        { resolution: { contains: search } },
+        { comments: { contains: search } },
+      ];
+    }
+
+    if (startDate || endDate) {
+      where.createdAt = {};
+      if (startDate) {
+        where.createdAt.gte = new Date(startDate);
+      }
+      if (endDate) {
+        where.createdAt.lte = new Date(endDate);
+      }
+    }
+
+    const [data, total] = await Promise.all([
+      this.prisma.report.findMany({
+        where,
+        skip,
+        take: limit,
+        include: {
+          assignment: {
+            select: {
+              id: true,
+              name: true,
+            },
+          },
+        },
+        orderBy: {
+          createdAt: "desc",
+        },
+      }),
+      this.prisma.report.count({ where }),
+    ]);
+
+    return {
+      data,
+      pagination: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
+  private mapIssueTypeToReportType(issueType: string): ReportType {
+    switch (issueType.toLowerCase()) {
+      case "bug":
+      case "technical": {
+        return ReportType.BUG;
+      }
+
+      case "feedback": {
+        return ReportType.FEEDBACK;
+      }
+
+      case "suggestion": {
+        return ReportType.SUGGESTION;
+      }
+
+      case "performance": {
+        return ReportType.PERFORMANCE;
+      }
+
+      case "false_marking":
+      case "false marking":
+      case "grading": {
+        return ReportType.FALSE_MARKING;
+      }
+
+      case "content": {
+        return ReportType.FEEDBACK;
+      }
+
+      case "critical": {
+        return ReportType.BUG;
+      }
+
+      default: {
+        return ReportType.OTHER;
+      }
+    }
+  }
+
+  private calculateTextSimilarity(text1: string, text2: string): number {
+    try {
+      const tokenizer = new natural.WordTokenizer();
+      const tokens1 = tokenizer.tokenize(text1.toLowerCase()) || [];
+      const tokens2 = tokenizer.tokenize(text2.toLowerCase()) || [];
+
+      const stopWords = new Set([
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "but",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "with",
+      ]);
+
+      const filteredTokens1 = tokens1.filter(
+        (token) => token.length > 2 && !stopWords.has(token),
+      );
+
+      const filteredTokens2 = tokens2.filter(
+        (token) => token.length > 2 && !stopWords.has(token),
+      );
+
+      if (filteredTokens1.length === 0 || filteredTokens2.length === 0) {
+        return 0;
+      }
+
+      const tf1: Record<string, number> = {};
+      const tf2: Record<string, number> = {};
+
+      for (const token of filteredTokens1) {
+        tf1[token] = (tf1[token] || 0) + 1;
+      }
+
+      for (const token of filteredTokens2) {
+        tf2[token] = (tf2[token] || 0) + 1;
+      }
+
+      const uniqueTerms = new Set([...Object.keys(tf1), ...Object.keys(tf2)]);
+
+      const vector1: number[] = [];
+      const vector2: number[] = [];
+
+      for (const term of uniqueTerms) {
+        const idf = tf1[term] && tf2[term] ? 1 : 2;
+
+        vector1.push(((tf1[term] || 0) / filteredTokens1.length) * idf);
+        vector2.push(((tf2[term] || 0) / filteredTokens2.length) * idf);
+      }
+
+      let dotProduct = 0;
+      let magnitude1 = 0;
+      let magnitude2 = 0;
+
+      for (const [index, element] of vector1.entries()) {
+        dotProduct += element * vector2[index];
+        magnitude1 += element * element;
+        magnitude2 += vector2[index] * vector2[index];
+      }
+
+      magnitude1 = Math.sqrt(magnitude1);
+      magnitude2 = Math.sqrt(magnitude2);
+
+      if (magnitude1 === 0 || magnitude2 === 0) {
+        return 0;
+      }
+
+      return dotProduct / (magnitude1 * magnitude2);
+    } catch {
+      return this.calculateSimpleSimilarity(text1, text2);
+    }
+  }
+
+  private calculateSimpleSimilarity(text1: string, text2: string): number {
+    const words1 = text1
+      .toLowerCase()
+      .split(/\W+/)
+      .filter((w) => w.length > 2);
+    const words2 = text2
+      .toLowerCase()
+      .split(/\W+/)
+      .filter((w) => w.length > 2);
+
+    const set1 = new Set(words1);
+    const set2 = new Set(words2);
+
+    const intersection = new Set([...set1].filter((x) => set2.has(x)));
+    const union = new Set([...set1, ...set2]);
+
+    return intersection.size / union.size;
+  }
+
+  private async findSimilarReports(
+    description: string,
+    issueType: ReportType,
+    assignmentId?: number,
+    excludeReportId?: number,
+  ): Promise<
+    Array<{
+      id: number;
+      issueNumber?: number;
+      description: string;
+      assignmentId?: number;
+      status: ReportStatus;
+      similarity: number;
+    }>
+  > {
+    const whereConditions: {
+      issueType: ReportType;
+      status: {
+        in: ReportStatus[];
+      };
+      createdAt: {
+        gte: Date;
+      };
+      id?: { not?: number };
+      assignmentId?: number;
+    } = {
+      issueType: issueType,
+      status: {
+        in: [ReportStatus.OPEN, ReportStatus.IN_PROGRESS],
+      },
+      createdAt: {
+        gte: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000),
+      },
+    };
+
+    if (excludeReportId) {
+      whereConditions.id = { not: excludeReportId };
+    }
+
+    const limit = description.length > 100 ? 50 : 20;
+
+    const potentialMatches = await this.prisma.report.findMany({
+      where: whereConditions,
+      select: {
+        id: true,
+        description: true,
+        issueNumber: true,
+        status: true,
+        assignmentId: true,
+        createdAt: true,
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+      take: limit,
+    });
+
+    const scoredMatches = potentialMatches.map((report) => {
+      let similarity = this.calculateTextSimilarity(
+        description,
+        report.description,
+      );
+
+      if (assignmentId && report.assignmentId === assignmentId) {
+        similarity *= 1.2;
+      }
+
+      const ageInDays =
+        (Date.now() - new Date(report.createdAt).getTime()) /
+        (1000 * 3600 * 24);
+      const recencyBoost = Math.max(0.8, 1 - (ageInDays / 90) * 0.2);
+      similarity *= recencyBoost;
+
+      return {
+        ...report,
+        similarity: Math.min(similarity, 1),
+      };
+    });
+
+    return scoredMatches
+      .filter((report) => report.similarity >= 0.4)
+      .sort((a, b) => b.similarity - a.similarity);
+  }
+
+  async reportIssue(
+    dto: ReportIssueDto,
+    userSession?: {
+      role?: UserRole;
+      assignmentId?: number;
+      attemptId?: number;
+      userId?: string;
+    },
+    screenshot?: Express.Multer.File,
+  ): Promise<{
+    message: string;
+    reportId?: number;
+    similarReports?: Array<{
+      id: number;
+      issueNumber?: number;
+      similarity: number;
+      description: string;
+      status: string;
+    }>;
+    isDuplicate?: boolean;
+  }> {
+    const {
+      issueType,
+      description,
+      attemptId,
+      severity,
+      additionalDetails,
+      portal = {},
+      diagnostics,
+    } = dto;
+    const assignmentId = userSession?.assignmentId;
+    // additionalDetails is a free-form bag filled by three different clients,
+    // so every read of it is guarded.
+    const detailString = (key: string): string | undefined =>
+      typeof additionalDetails?.[key] === "string"
+        ? additionalDetails[key]
+        : undefined;
+
+    if (!issueType) {
+      this.logger.error("submitReport: missing issueType in DTO", {
+        user_id: userSession?.userId,
+        assignment_id: assignmentId,
+        attempt_id: attemptId,
+        dto_keys: dto ? Object.keys(dto) : undefined,
+      });
+      throw new InternalServerErrorException("issueType is required");
+    }
+
+    const role = userSession?.role || "Author";
+    const issueSeverity: "info" | "warning" | "error" | "critical" =
+      severity || defaultSeverityForIssueType(issueType);
+    const userEmail = additionalDetails?.userEmail || userSession?.userId;
+    const safeUserEmail =
+      typeof userEmail === "string" && userEmail.trim().length > 0
+        ? userEmail
+        : "Unknown";
+    const recentReports = await this.prisma.report.findMany({
+      where: {
+        createdAt: {
+          gte: new Date(Date.now() - 24 * 60 * 60 * 1000),
+        },
+        reporterId: userSession?.userId,
+      },
+      select: {
+        id: true,
+      },
+    });
+    if (recentReports.length > 5) {
+      throw new HttpException(
+        "You have reported too many issues in the last 24 hours. Please try again later.",
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    let screenshotUrl: string | undefined;
+    if (screenshot && screenshot.buffer) {
+      try {
+        const debugBucket = process.env.IBM_COS_DEBUG_BUCKET;
+        if (debugBucket) {
+          const uniqueId =
+            Date.now().toString(36) + Math.random().toString(36).slice(2);
+          const screenshotKey = `issue-screenshots/${uniqueId}-${screenshot.originalname}`;
+
+          await this.filesService.directUpload(
+            screenshot,
+            debugBucket,
+            screenshotKey,
+          );
+
+          screenshotUrl = screenshotKey;
+        }
+      } catch {
+        // Ignore screenshot upload failures; continue without screenshot
+      }
+    }
+
+    const mappedIssueType = this.mapIssueTypeToReportType(issueType);
+
+    const similarReports = await this.findSimilarReports(
+      description,
+      mappedIssueType,
+      assignmentId,
+    );
+
+    const potentialDuplicate = similarReports.find((r) => r.similarity > 0.85);
+    const highSimilarityReport = similarReports.find((r) => r.similarity > 0.7);
+
+    const ticketTitle = buildSnSupportTicketTitle({
+      issueType,
+      assignmentId,
+      attemptId,
+      description,
+    });
+
+    const finalScreenshotUrl =
+      screenshotUrl || additionalDetails?.screenshotUrl;
+    let fullScreenshotUrl: string | undefined;
+    if (finalScreenshotUrl && typeof finalScreenshotUrl === "string") {
+      const debugBucket = process.env.IBM_COS_DEBUG_BUCKET;
+      const cosEndpoint = process.env.IBM_COS_ENDPOINT;
+
+      if (
+        cosEndpoint &&
+        debugBucket &&
+        (screenshotUrl || finalScreenshotUrl.includes(debugBucket))
+      ) {
+        fullScreenshotUrl = screenshotUrl
+          ? `${cosEndpoint}/${debugBucket}/${screenshotUrl}`
+          : `${cosEndpoint}/${debugBucket}/${finalScreenshotUrl}`;
+      }
+    }
+
+    // SN Support is the support queue for new reports. The v2 API requires a
+    // reporter email, so anonymous reports exist only as DB rows below.
+    //
+    // The token decides which SN Support product the ticket lands in, so it is
+    // resolved once here and reused: resolving twice could file duplicates in
+    // two products, since SN Support's idempotency is per product.
+    const portalContext = {
+      portalHost: portal.portalHost,
+      portalName: portal.portalName,
+      portalUrl: portal.portalUrl,
+    };
+    const canForward =
+      this.snSupportService.isConfigured() && safeUserEmail !== "Unknown";
+    // Only when a ticket is actually going out: routing calls portal-manager,
+    // and an anonymous report or a disabled integration has nowhere to send.
+    const route = canForward
+      ? await this.supportRouting.resolve(portalContext)
+      : undefined;
+    // portal-manager knows a portal's real display name; the host is only a
+    // stand-in until it answers.
+    const portalName = route?.portalName ?? portalContext.portalName;
+
+    let snTicketKey: string | undefined;
+    if (canForward && route?.token) {
+      const supportDescription = [
+        stripSectionLabelMarkdown(description),
+        "",
+        `Issue type: ${issueType}`,
+        `Reporter role: ${role}`,
+        `Severity: ${issueSeverity}`,
+        `Assignment ID: ${assignmentId ?? "N/A"}`,
+        `Attempt ID: ${attemptId ?? "N/A"}`,
+        ...(diagnostics ? [summarizeReportDiagnostics(diagnostics)] : []),
+      ].join("\n");
+
+      try {
+        const snTicket = await this.snSupportService.createTicket(
+          {
+            title: ticketTitle,
+            description: supportDescription,
+            reporterEmail: safeUserEmail,
+            severity: issueSeverity,
+            issueType: detailString("category") ?? issueType,
+            pageUrl: detailString("pageUrl"),
+            portalName,
+            portalUrl: portalContext.portalUrl,
+            courseTitle: detailString("courseTitle"),
+            toolName: "Mark",
+            browser: detailString("browser"),
+            chatHistoryUrl: detailString("chatHistoryUrl"),
+            screenshotUrl: fullScreenshotUrl,
+          },
+          route.token,
+        );
+        snTicketKey = snTicket.ticketKey;
+        // A ticket in the wrong product looks exactly like one in the right
+        // product, so how the product was chosen is logged on every report.
+        this.logger.log("Created SN Support ticket for report", {
+          ticket_key: snTicket.ticketKey,
+          assignment_id: assignmentId,
+          attempt_id: attemptId,
+          portal_host: portalContext.portalHost,
+          portal_name: portalName,
+          product: route.productName,
+          token_source: route.via,
+        });
+        if (route.via === "default" || route.via === "legacy") {
+          this.logger.warn(
+            `SN ticket ${snTicket.ticketKey} filed under ${route.productName ?? "the legacy token"} — no product matched portal ${portalContext.portalHost ?? "(unknown)"}`,
+          );
+        }
+      } catch (error) {
+        // The report survives as a DB row (and in the admin dashboard), so
+        // the submission itself is not failed — but nobody is watching that
+        // queue, so this needs attention.
+        this.logger.error("SN Support ticket creation failed", {
+          error: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+          assignment_id: assignmentId,
+          attempt_id: attemptId,
+        });
+      }
+    } else {
+      // Without a ticket the report reaches no support queue — DB row only.
+      // portal_host is logged even here: while the integration is off it is
+      // the only way to sample what LTI actually sends as a return URL, which
+      // is what routing will key off once it is on.
+      this.logger.warn("Report not forwarded to SN Support", {
+        configured: this.snSupportService.isConfigured(),
+        has_token: Boolean(route?.token),
+        has_reporter_email: safeUserEmail !== "Unknown",
+        portal_host: portalContext.portalHost,
+        assignment_id: assignmentId,
+        attempt_id: attemptId,
+      });
+    }
+
+    // Duplicates inherit the parent's resolution so reporters aren't told a
+    // fixed issue is still open.
+    let reportStatus: ReportStatus = ReportStatus.OPEN;
+    let statusMessage = "Your issue has been reported and is being reviewed.";
+    let closureReason: string | null = null;
+    const isDuplicate = Boolean(potentialDuplicate);
+
+    if (potentialDuplicate) {
+      const parentReport = await this.prisma.report.findUnique({
+        where: { id: potentialDuplicate.id },
+        select: { status: true, closureReason: true },
+      });
+
+      if (
+        parentReport &&
+        (parentReport.status === ReportStatus.RESOLVED ||
+          parentReport.status === ReportStatus.CLOSED)
+      ) {
+        reportStatus = parentReport.status;
+        closureReason = parentReport.closureReason ?? null;
+        statusMessage =
+          parentReport.closureReason === "wontfix"
+            ? "This issue was closed as it won't be implemented or fixed."
+            : parentReport.closureReason === "invalid"
+              ? "This issue was closed as it was deemed invalid or not reproducible."
+              : parentReport.closureReason === "duplicate"
+                ? "This issue was closed as a duplicate of another issue."
+                : "This issue was resolved.";
+      }
+    }
+
+    const reportData: {
+      duplicateOfReportId: number | null;
+      reporterId: string;
+      assignmentId: number | null;
+      attemptId: number | null;
+      issueType: ReportType;
+      description: string;
+      author: boolean;
+      status: ReportStatus;
+      statusMessage: string;
+      relatedToReportId?: number | null;
+      similarityScore?: number | null;
+      closureReason?: string | null;
+    } = {
+      reporterId: userSession?.userId || "anonymous",
+      assignmentId: typeof assignmentId === "number" ? assignmentId : null,
+      attemptId: typeof attemptId === "number" ? attemptId : null,
+      issueType: mappedIssueType,
+      description: description,
+      author: role?.toLowerCase() === "author",
+      status: reportStatus,
+      statusMessage: statusMessage,
+      duplicateOfReportId: null,
+      relatedToReportId: null,
+      similarityScore: null,
+      closureReason,
+    };
+
+    if (potentialDuplicate) {
+      reportData.duplicateOfReportId = potentialDuplicate.id;
+      reportData.similarityScore = potentialDuplicate.similarity;
+    } else if (highSimilarityReport) {
+      reportData.relatedToReportId = highSimilarityReport.id;
+      reportData.similarityScore = highSimilarityReport.similarity;
+    }
+
+    try {
+      const report = await this.prisma.report.create({ data: reportData });
+
+      if (diagnostics) {
+        await this.storeReportDiagnostics(report.id, diagnostics);
+      }
+
+      // Fire-and-forget: Flo is best-effort telemetry. Never block the
+      // request on its NATS publish — the underlying ts-nats client opens a
+      // fresh connection per call and has no built-in deadline.
+      void this.floService
+        .sendError(ticketTitle, description, {
+          severity: issueSeverity,
+          tags: ["mark", "chat", "report", role || "user", issueType],
+          assignmentId,
+          attemptId,
+          sn_ticket: snTicketKey,
+          report_id: report.id,
+          is_duplicate: isDuplicate,
+          portalName,
+          portalUrl: portalContext.portalUrl,
+        })
+        .catch((error) => {
+          this.logger.warn(
+            `Flo sendError dispatch failed for report ${report.id}: ${
+              (error as Error).message
+            }`,
+          );
+        });
+
+      const ticketSegment = snTicketKey
+        ? `Support ticket ${snTicketKey} has been created and our team will review it soon.`
+        : `Our team will review it soon.`;
+      let message = `Thank you for your report. ${ticketSegment} You can check the status anytime by asking about your reported issues.`;
+
+      if (isDuplicate) {
+        message = `Thank you for your report. This looks like a duplicate of a previously reported issue, so your report has been linked to it and they will be handled together. You can check the status anytime by asking about your reported issues.`;
+
+        if (
+          reportStatus === ReportStatus.RESOLVED ||
+          reportStatus === ReportStatus.CLOSED
+        ) {
+          message += ` Note that the existing issue has already been ${
+            reportStatus === ReportStatus.RESOLVED ? "resolved" : "closed"
+          }.`;
+        }
+      } else if (highSimilarityReport) {
+        message = `Thank you for your report. ${ticketSegment} It has been linked to a similar existing report and our team will review them together. You can check the status anytime by asking about your reported issues.`;
+      } else if (similarReports.length > 0) {
+        message = `Thank you for your report. ${ticketSegment} We found ${
+          similarReports.length
+        } similar ${
+          similarReports.length === 1 ? "issue" : "issues"
+        } that might be related. You can check the status anytime by asking about your reported issues.`;
+      }
+
+      return {
+        message,
+        reportId: report.id,
+        similarReports:
+          similarReports.length > 0
+            ? similarReports.slice(0, 3).map((r) => ({
+                id: r.id,
+                issueNumber: r.issueNumber,
+                similarity: r.similarity,
+                description: r.description,
+                status: r.status.toString(),
+              }))
+            : undefined,
+        isDuplicate,
+      };
+    } catch (error) {
+      this.logger.error("submitReport: failed to persist report", {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+        assignment_id: assignmentId,
+        attempt_id: attemptId,
+        sn_ticket: snTicketKey,
+      });
+
+      return {
+        message:
+          "We encountered an issue while submitting your report. Your feedback is still important to us - please try again later.",
+      };
+    }
+  }
+
+  /**
+   * The capture is context for whoever triages the report. Losing it must not
+   * lose the report, so a failure here is logged and the submission carries on.
+   */
+  private async storeReportDiagnostics(
+    reportId: number,
+    diagnostics: ReportDiagnostics,
+  ): Promise<void> {
+    try {
+      await this.prisma.reportDiagnostics.create({
+        data: {
+          reportId,
+          data: diagnostics as unknown as Prisma.InputJsonValue,
+        },
+      });
+      this.logger.log("Stored report diagnostics", {
+        report_id: reportId,
+        attempt_id: diagnostics.session?.attemptId,
+        recent_requests: diagnostics.requests?.length ?? 0,
+      });
+    } catch (error) {
+      this.logger.error("Failed to store report diagnostics", {
+        report_id: reportId,
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+    }
+  }
+
+  /**
+   * Admin-only read (the route carries the guard). Diagnostics live in their
+   * own table so no report query that serves a learner or author returns them.
+   */
+  async getReportDiagnostics(reportId: number) {
+    const row = await this.prisma.reportDiagnostics.findUnique({
+      where: { reportId },
+    });
+    if (!row) {
+      throw new NotFoundException("No diagnostics for this report");
+    }
+    return {
+      reportId: row.reportId,
+      capturedAt: row.createdAt,
+      diagnostics: row.data,
+    };
+  }
+
+  async getReportsForAssignment(assignmentId: number) {
+    const reports = await this.prisma.report.findMany({
+      where: {
+        assignmentId,
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+
+    for (const report of reports) {
+      if (report.duplicateOfReportId || report.relatedToReportId) {
+        const relatedId =
+          report.duplicateOfReportId || report.relatedToReportId;
+        const relatedReport = await this.prisma.report.findUnique({
+          where: { id: relatedId },
+          select: {
+            id: true,
+            issueNumber: true,
+            description: true,
+            status: true,
+          },
+        });
+
+        if (relatedReport) {
+          report.relatedToReportId = relatedReport.id;
+        }
+      }
+    }
+
+    return reports;
+  }
+
+  async getSimilarReports(reportId: number) {
+    const report = await this.prisma.report.findUnique({
+      where: { id: reportId },
+      select: {
+        id: true,
+        description: true,
+        issueType: true,
+        assignmentId: true,
+        duplicateOfReportId: true,
+        relatedToReportId: true,
+      },
+    });
+
+    if (!report) {
+      throw new NotFoundException(`Report with ID ${reportId} not found`);
+    }
+
+    const directlyRelated = await this.prisma.report.findMany({
+      where: {
+        OR: [
+          { id: report.duplicateOfReportId },
+          { id: report.relatedToReportId },
+          { duplicateOfReportId: reportId },
+          { relatedToReportId: reportId },
+        ],
+      },
+      select: {
+        id: true,
+        issueNumber: true,
+        description: true,
+        status: true,
+        createdAt: true,
+        updatedAt: true,
+        duplicateOfReportId: true,
+        relatedToReportId: true,
+        similarityScore: true,
+      },
+    });
+
+    if (directlyRelated.length > 0) {
+      return directlyRelated.map((related) => ({
+        ...related,
+        relationshipType:
+          related.id === report.duplicateOfReportId
+            ? "parent"
+            : related.id === report.relatedToReportId
+              ? "related"
+              : related.duplicateOfReportId === reportId
+                ? "duplicate"
+                : "related",
+      }));
+    }
+
+    const similarReports = await this.findSimilarReports(
+      report.description,
+      report.issueType,
+      report.assignmentId,
+      reportId,
+    );
+
+    return similarReports.map((similar) => ({
+      ...similar,
+      relationshipType: "similar",
+    }));
+  }
+
+  async getReportsForUser(userId: string) {
+    const reports = await this.prisma.report.findMany({
+      where: {
+        reporterId: userId,
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+
+    // Pure read: do not call GitHub or write to the DB on a list endpoint.
+    // GitHub → DB sync is driven by the webhook handler and the detail view;
+    // doing it here per-report fanned out N×M concurrent Prisma queries and
+    // routinely exhausted the connection pool.
+    //
+    // Duplicates still need the parent's resolved/closed status overlaid on
+    // the response. Batch-fetch all parents in a single query.
+    const parentIds = [
+      ...new Set(
+        reports
+          .map((r) => r.duplicateOfReportId)
+          .filter((id): id is number => typeof id === "number"),
+      ),
+    ];
+
+    const parents =
+      parentIds.length > 0
+        ? await this.prisma.report.findMany({
+            where: { id: { in: parentIds } },
+            select: {
+              id: true,
+              issueNumber: true,
+              status: true,
+              statusMessage: true,
+              closureReason: true,
+            },
+          })
+        : [];
+
+    const parentById = new Map(parents.map((p) => [p.id, p]));
+
+    return reports.map((report) => {
+      if (!report.duplicateOfReportId) return report;
+
+      const parent = parentById.get(report.duplicateOfReportId);
+      if (!parent) return report;
+
+      const parentClosed =
+        parent.status === ReportStatus.RESOLVED ||
+        parent.status === ReportStatus.CLOSED;
+
+      if (parentClosed && parent.status !== report.status) {
+        report.status = parent.status;
+        report.statusMessage = `This issue was marked as a duplicate of issue #${
+          parent.issueNumber
+        } which has been ${
+          parent.status === ReportStatus.RESOLVED ? "resolved" : "closed"
+        }.`;
+        if (parent.closureReason) {
+          report.closureReason = parent.closureReason;
+        }
+      }
+
+      return report;
+    });
+  }
+
+  async getReportComments(reportId: number, userSession: UserSession) {
+    const report = await this.prisma.report.findUnique({
+      where: { id: reportId },
+    });
+
+    if (!report) {
+      throw new NotFoundException(`Report with ID ${reportId} not found`);
+    }
+
+    if (
+      report.reporterId !== userSession.userId &&
+      userSession.role !== UserRole.ADMIN
+    ) {
+      throw new NotFoundException(`Report with ID ${reportId} not found`);
+    }
+
+    if (!report.issueNumber) {
+      return { comments: [] };
+    }
+
+    const comments = await this.fetchGitHubIssueComments(report.issueNumber);
+
+    const latestDeveloperComment = [...comments]
+      .sort(
+        (a, b) =>
+          new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+      )
+      .find(
+        (c) => c.author !== report.reporterId && c.body !== report.comments,
+      );
+
+    if (latestDeveloperComment) {
+      await this.prisma.report.update({
+        where: { id: reportId },
+        data: { comments: latestDeveloperComment.body, updatedAt: new Date() },
+      });
+
+      await this.sendReportEmail(
+        report.reporterId || undefined,
+        `Update on your report #${report.issueNumber ?? report.id}`,
+        `New developer comment:\n\n${latestDeveloperComment.body}`,
+      );
+    }
+
+    return { comments };
+  }
+
+  async addReportComment(
+    reportId: number,
+    comment: string,
+    userSession: UserSession,
+  ) {
+    const report = await this.prisma.report.findUnique({
+      where: { id: reportId },
+    });
+
+    if (!report) {
+      throw new NotFoundException(`Report with ID ${reportId} not found`);
+    }
+
+    if (
+      report.reporterId !== userSession.userId &&
+      userSession.role !== UserRole.ADMIN
+    ) {
+      throw new NotFoundException(`Report with ID ${reportId} not found`);
+    }
+
+    // Reports created after the SN Support cutover have no GitHub issue;
+    // their comment is delivered by email below. GitHub-era reports keep
+    // getting the issue comment so the mark-support thread stays complete.
+    if (report.issueNumber) {
+      const githubOwner = process.env.GITHUB_OWNER;
+      const githubRepo = process.env.GITHUB_REPO;
+      const token = await this.getInstallationToken();
+
+      if (!githubOwner || !githubRepo || !token) {
+        this.logger.error("addReportComment: GitHub config or token missing", {
+          report_id: report.id,
+          issue_number: report.issueNumber,
+          owner_set: !!githubOwner,
+          repo_set: !!githubRepo,
+          token_set: !!token,
+        });
+        throw new InternalServerErrorException(
+          "GitHub repository configuration or token missing",
+        );
+      }
+
+      await axios.post(
+        `https://api.github.com/repos/${githubOwner}/${githubRepo}/issues/${report.issueNumber}/comments`,
+        {
+          body: `**${userSession.role ?? "user"} (${
+            userSession.userId
+          })**\n\n${comment}`,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+          },
+        },
+      );
+    }
+
+    const reporterEmail = report.reporterId;
+    const developerEmail = this.getDeveloperNotificationEmail();
+    const subject = `Update on your report #${report.issueNumber ?? report.id}`;
+    const userIsReporter = report.reporterId === userSession.userId;
+    if (userIsReporter) {
+      await this.sendReportEmail(
+        developerEmail,
+        subject,
+        `New comment from user ${report.reporterId}:\n\n${comment}`,
+      );
+    } else {
+      await this.sendReportEmail(
+        reporterEmail,
+        subject,
+        `New comment from developer (${userSession.userId}):\n\n${comment}`,
+      );
+
+      // Mark as in-progress when a developer/admin responds
+      if (report.status === ReportStatus.OPEN) {
+        await this.prisma.report.update({
+          where: { id: report.id },
+          data: {
+            status: ReportStatus.IN_PROGRESS,
+            statusMessage: "Developer is investigating your report",
+            updatedAt: new Date(),
+          },
+        });
+      }
+    }
+
+    return { message: "Comment added", reportId };
+  }
+
+  async getReportDetailsForUser(reportId: number, userId: string) {
+    const report = await this.prisma.report.findUnique({
+      where: { id: reportId },
+    });
+
+    if (!report) {
+      throw new NotFoundException(`Report with ID ${reportId} not found`);
+    }
+
+    if (report.reporterId !== userId) {
+      throw new NotFoundException(`Report with ID ${reportId} not found`);
+    }
+
+    if (report.issueNumber) {
+      try {
+        const previousDeveloperComment = report.comments;
+        const { status, statusMessage, developerComment, closureReason } =
+          await this.syncGitHubIssueStatus(report.issueNumber);
+
+        if (
+          status !== report.status ||
+          developerComment ||
+          closureReason !== report.closureReason
+        ) {
+          const updates: {
+            status: ReportStatus;
+            statusMessage: string;
+            updatedAt: Date;
+            comments?: string;
+            resolution?: string;
+            closureReason?: string;
+          } = {
+            status,
+            statusMessage,
+            updatedAt: new Date(),
+          };
+
+          if (developerComment) {
+            updates.comments = developerComment;
+          }
+
+          if (closureReason) {
+            updates.closureReason = closureReason;
+          }
+
+          await this.prisma.report.update({
+            where: { id: report.id },
+            data: updates,
+          });
+
+          report.status = status;
+          report.statusMessage = statusMessage;
+          report.closureReason = closureReason;
+
+          if (developerComment) {
+            report.comments = developerComment;
+          }
+
+          if (
+            developerComment &&
+            developerComment !== previousDeveloperComment
+          ) {
+            const reporterEmail = report.reporterId;
+            await this.sendReportEmail(
+              reporterEmail || undefined,
+              `Update on your report #${report.issueNumber ?? report.id}`,
+              `New developer comment:\n\n${developerComment}`,
+            );
+          }
+        }
+      } catch (error) {
+        this.logger.error(
+          `Error syncing GitHub issue status for report ID ${reportId}`,
+          {
+            reportId,
+            error: error instanceof Error ? error.message : String(error),
+            stack: error instanceof Error ? error.stack : undefined,
+          },
+        );
+      }
+    }
+
+    const relatedReports = await this.getSimilarReports(reportId);
+
+    let duplicateInfo = null;
+    if (report.duplicateOfReportId) {
+      const parentReport = await this.prisma.report.findUnique({
+        where: { id: report.duplicateOfReportId },
+        select: {
+          id: true,
+          issueNumber: true,
+          status: true,
+          statusMessage: true,
+          description: true,
+          closureReason: true,
+        },
+      });
+
+      if (parentReport) {
+        duplicateInfo = {
+          isDuplicate: true,
+          originalReport: parentReport,
+          similarityScore: report.similarityScore,
+        };
+
+        if (
+          parentReport.status !== report.status &&
+          (parentReport.status === ReportStatus.RESOLVED ||
+            parentReport.status === ReportStatus.CLOSED)
+        ) {
+          const statusMessage = `This issue was marked as a duplicate of issue #${
+            parentReport.issueNumber
+          } which has been ${
+            parentReport.status === ReportStatus.RESOLVED
+              ? "resolved"
+              : "closed"
+          }.`;
+
+          const updateData: {
+            status: ReportStatus;
+            statusMessage: string;
+            updatedAt: Date;
+            comments?: string;
+            resolution?: string;
+            closureReason?: string;
+          } = {
+            status: parentReport.status,
+            statusMessage,
+            updatedAt: new Date(),
+          };
+
+          if (parentReport.closureReason) {
+            updateData.closureReason = parentReport.closureReason;
+          }
+
+          await this.prisma.report.update({
+            where: { id: report.id },
+            data: updateData,
+          });
+
+          report.status = parentReport.status;
+          report.statusMessage = statusMessage;
+
+          if (parentReport.closureReason) {
+            report.closureReason = parentReport.closureReason;
+          }
+        }
+      }
+    }
+
+    const duplicates = await this.prisma.report.findMany({
+      where: {
+        duplicateOfReportId: report.id,
+      },
+      select: {
+        id: true,
+        issueNumber: true,
+        description: true,
+        createdAt: true,
+        similarityScore: true,
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+
+    return {
+      id: report.id,
+      issueType: report.issueType,
+      description: report.description,
+      status: report.status,
+      statusMessage: report.statusMessage,
+      created: report.createdAt,
+      updated: report.updatedAt,
+      issueNumber: report.issueNumber,
+      developerComment: report.comments,
+      resolution: report.resolution,
+      closureReason: report.closureReason,
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      duplicateInfo,
+      duplicates: duplicates.length > 0 ? duplicates : undefined,
+      relatedReports: relatedReports.length > 0 ? relatedReports : undefined,
+    };
+  }
+
+  async syncGitHubIssueStatus(issueNumber: number): Promise<{
+    status: ReportStatus;
+    statusMessage: string;
+    developerComment?: string;
+    closureReason?: string;
+  }> {
+    const { githubOwner, githubRepo, token } = await this.getGithubConfig(
+      "fetchSyncedIssueState",
+      { issueNumber },
+    );
+
+    try {
+      const issueResponse = await axios.get(
+        `https://api.github.com/repos/${githubOwner}/${githubRepo}/issues/${issueNumber}`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+          },
+        },
+      );
+
+      const issue = issueResponse.data as {
+        state: string;
+        labels: Array<{ name: string }>;
+        closed_at: string | null;
+        body: string;
+      };
+
+      let developerComment: string | undefined;
+      let closureReason: string | undefined;
+
+      if (issue.state === "closed" && issue.closed_at) {
+        const isDuplicate = issue.labels.some((label) =>
+          label.name.toLowerCase().includes("duplicate"),
+        );
+
+        const isWontFix = issue.labels.some(
+          (label) =>
+            label.name.toLowerCase().includes("wontfix") ||
+            label.name.toLowerCase().includes("won't fix") ||
+            label.name.toLowerCase().includes("not planned"),
+        );
+
+        const isInvalid = issue.labels.some(
+          (label) =>
+            label.name.toLowerCase().includes("invalid") ||
+            label.name.toLowerCase().includes("not reproducible"),
+        );
+
+        if (isDuplicate) {
+          closureReason = "duplicate";
+        } else if (isWontFix) {
+          closureReason = "wontfix";
+        } else if (isInvalid) {
+          closureReason = "invalid";
+        } else {
+          closureReason = "fixed";
+        }
+
+        const commentsResponse = await axios.get(
+          `https://api.github.com/repos/${githubOwner}/${githubRepo}/issues/${issueNumber}/comments`,
+          {
+            headers: {
+              Authorization: `token ${token}`,
+              Accept: "application/vnd.github.v3+json",
+            },
+          },
+        );
+
+        const comments = commentsResponse.data as Array<{
+          body: string;
+          created_at: string;
+          user: { login: string };
+        }>;
+
+        const sortedComments = comments.sort(
+          (a, b) =>
+            new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+        );
+
+        const closingComment = sortedComments.find((comment) => {
+          const isBeforeClosure =
+            new Date(comment.created_at) <= new Date(issue.closed_at);
+          const mentionsClosureReason =
+            (closureReason === "duplicate" &&
+              comment.body.toLowerCase().includes("duplicate")) ||
+            (closureReason === "wontfix" &&
+              (comment.body.toLowerCase().includes("won't fix") ||
+                comment.body.toLowerCase().includes("wontfix") ||
+                comment.body.toLowerCase().includes("not planned"))) ||
+            (closureReason === "invalid" &&
+              (comment.body.toLowerCase().includes("invalid") ||
+                comment.body.toLowerCase().includes("not reproducible")));
+
+          return (
+            isBeforeClosure && (comments.length === 1 || mentionsClosureReason)
+          );
+        });
+
+        if (closingComment) {
+          developerComment = closingComment.body;
+        }
+      }
+
+      let status: ReportStatus = ReportStatus.OPEN;
+      let statusMessage =
+        "Your issue is currently open, developers didn't pick it up yet";
+
+      if (issue.state === "closed") {
+        if (closureReason === "fixed" || !closureReason) {
+          status = ReportStatus.RESOLVED;
+          statusMessage = "This issue was resolved by our team.";
+        } else {
+          status = ReportStatus.CLOSED;
+          statusMessage =
+            closureReason === "duplicate"
+              ? "This issue was closed as a duplicate of another issue."
+              : closureReason === "wontfix"
+                ? "This issue was closed as it won't be implemented or fixed."
+                : "This issue was closed as it was deemed invalid or not reproducible.";
+
+          if (developerComment) {
+            statusMessage += ` Developer comment: ${developerComment.slice(
+              0,
+              100,
+            )}${developerComment.length > 100 ? "..." : ""}`;
+          }
+        }
+      } else {
+        const inProgressLabel = issue.labels.find(
+          (label: { name: string }) =>
+            label.name === "in progress" ||
+            label.name === "in-progress" ||
+            label.name === "working",
+        );
+
+        if (inProgressLabel) {
+          status = ReportStatus.IN_PROGRESS;
+          statusMessage = "Our team is actively working on this issue.";
+        }
+      }
+
+      const reports = await this.prisma.report.findMany({
+        where: { issueNumber },
+      });
+
+      if (reports.length > 0) {
+        await Promise.all(
+          reports.map(async (report) => {
+            const updateData = {
+              status,
+              statusMessage,
+              updatedAt: new Date(),
+              resolution: report.resolution,
+              closureReason: report.closureReason,
+              comments: report.comments,
+            };
+
+            if (developerComment) {
+              updateData.comments = developerComment;
+            }
+
+            if (closureReason) {
+              updateData.closureReason = closureReason;
+            }
+
+            if (report.status !== status) {
+              await this.createStatusChangeNotification(
+                report.id,
+                status,
+                statusMessage,
+                closureReason,
+              );
+            }
+
+            await this.prisma.report.update({
+              where: { id: report.id },
+              data: updateData,
+            });
+
+            if (
+              (status === ReportStatus.RESOLVED ||
+                status === ReportStatus.CLOSED) &&
+              report.id
+            ) {
+              await this.updateDuplicateReportsStatus(
+                report.id,
+                status,
+                statusMessage,
+                closureReason,
+              );
+            }
+          }),
+        );
+      }
+
+      return {
+        status,
+        statusMessage,
+        developerComment,
+        closureReason,
+      };
+    } catch {
+      return {
+        status: ReportStatus.OPEN,
+        statusMessage: "Unable to retrieve current status.",
+      };
+    }
+  }
+
+  private async updateDuplicateReportsStatus(
+    parentReportId: number,
+    status: ReportStatus,
+    statusMessage: string,
+    closureReason?: string,
+  ) {
+    const duplicateReports = await this.prisma.report.findMany({
+      where: {
+        duplicateOfReportId: parentReportId,
+        status: {
+          notIn: [ReportStatus.RESOLVED, ReportStatus.CLOSED],
+        },
+      },
+    });
+
+    if (duplicateReports.length === 0) return;
+
+    const parentReport = await this.prisma.report.findUnique({
+      where: { id: parentReportId },
+      select: { issueNumber: true },
+    });
+
+    const updatedStatusMessage = parentReport?.issueNumber
+      ? `This issue was marked as a duplicate of issue #${
+          parentReport.issueNumber
+        } which has been ${
+          status === ReportStatus.RESOLVED ? "resolved" : "closed"
+        }.`
+      : statusMessage;
+
+    for (const report of duplicateReports) {
+      const updateData: {
+        status: ReportStatus;
+        statusMessage: string;
+        updatedAt: Date;
+        comments?: string;
+        resolution?: string;
+        closureReason?: string;
+      } = {
+        status,
+        statusMessage: updatedStatusMessage,
+        updatedAt: new Date(),
+      };
+
+      if (closureReason) {
+        updateData.closureReason = closureReason;
+      }
+
+      await this.prisma.report.update({
+        where: { id: report.id },
+        data: updateData,
+      });
+
+      await this.updateDuplicateReportsStatus(
+        report.id,
+        status,
+        updatedStatusMessage,
+        closureReason,
+      );
+    }
+  }
+
+  async updateReportStatus(
+    reportId: number,
+    status: ReportStatus,
+    statusMessage?: string,
+    resolution?: string,
+    userComment?: string,
+  ) {
+    const report = await this.prisma.report.findUnique({
+      where: { id: reportId },
+    });
+
+    if (!report) {
+      throw new NotFoundException(`Report with ID ${reportId} not found`);
+    }
+
+    let updatedResolution = resolution;
+    if (userComment) {
+      updatedResolution = updatedResolution
+        ? `${updatedResolution}\n\n**User Comment:** ${userComment}`
+        : `**User Comment:** ${userComment}`;
+    }
+
+    let closureReason: string | undefined;
+    if (status === ReportStatus.RESOLVED) {
+      closureReason = "fixed";
+    } else if (status === ReportStatus.CLOSED) {
+      const combinedText = `${statusMessage || ""} ${
+        resolution || ""
+      }`.toLowerCase();
+      if (combinedText.includes("duplicate")) {
+        closureReason = "duplicate";
+      } else if (
+        combinedText.includes("won't fix") ||
+        combinedText.includes("not planned")
+      ) {
+        closureReason = "wontfix";
+      } else if (
+        combinedText.includes("invalid") ||
+        combinedText.includes("not reproducible")
+      ) {
+        closureReason = "invalid";
+      } else {
+        closureReason = "fixed";
+      }
+    }
+
+    const updateData: {
+      status: ReportStatus;
+      statusMessage: string;
+      updatedAt: Date;
+      comments?: string;
+      resolution?: string;
+      closureReason?: string;
+    } = {
+      status,
+      statusMessage: statusMessage || this.getDefaultStatusMessage(status),
+      updatedAt: new Date(),
+    };
+
+    if (status === ReportStatus.RESOLVED || status === ReportStatus.CLOSED) {
+      updateData.resolution = updatedResolution || report.resolution;
+
+      if (closureReason) {
+        updateData.closureReason = closureReason;
+      }
+    }
+    const updatedReport = await this.prisma.report.update({
+      where: { id: reportId },
+      data: updateData,
+    });
+
+    await this.createStatusChangeNotification(
+      reportId,
+      status,
+      updateData.statusMessage,
+      closureReason,
+    );
+
+    if (report.issueNumber) {
+      try {
+        const githubOwner = process.env.GITHUB_OWNER;
+        const githubRepo = process.env.GITHUB_REPO;
+        const token = await this.getInstallationToken();
+
+        if (githubOwner && githubRepo && token) {
+          let updatedBody = report.description;
+
+          if (userComment) {
+            updatedBody += `\n\n---\n**User Comment:** ${userComment}`;
+          }
+
+          if (
+            updatedResolution &&
+            (status === ReportStatus.RESOLVED || status === ReportStatus.CLOSED)
+          ) {
+            updatedBody += `\n\n---\n**Resolution:** ${updatedResolution}`;
+          }
+
+          if (
+            status === ReportStatus.RESOLVED ||
+            status === ReportStatus.CLOSED
+          ) {
+            const labels = [];
+            if (closureReason === "duplicate") labels.push("duplicate");
+            if (closureReason === "wontfix") labels.push("wontfix");
+            if (closureReason === "invalid") labels.push("invalid");
+
+            await axios.patch(
+              `https://api.github.com/repos/${githubOwner}/${githubRepo}/issues/${report.issueNumber}`,
+              {
+                state: "closed",
+                body: updatedBody,
+                ...(labels.length > 0 ? { labels } : {}),
+              },
+              {
+                headers: {
+                  Authorization: `Bearer ${token}`,
+                  Accept: "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                },
+              },
+            );
+
+            const commentMessage =
+              closureReason === "duplicate"
+                ? "This issue is being closed as a duplicate."
+                : closureReason === "wontfix"
+                  ? "This issue is being closed as it won't be fixed or implemented."
+                  : closureReason === "invalid"
+                    ? "This issue is being closed as it was deemed invalid or not reproducible."
+                    : "This issue has been resolved.";
+
+            await axios.post(
+              `https://api.github.com/repos/${githubOwner}/${githubRepo}/issues/${report.issueNumber}/comments`,
+              {
+                body: `**Status Update:** ${commentMessage} ${
+                  resolution ? `\n\n**Resolution:** ${resolution}` : ""
+                }`,
+              },
+              {
+                headers: {
+                  Authorization: `token ${token}`,
+                  Accept: "application/vnd.github.v3+json",
+                },
+              },
+            );
+          } else {
+            await axios.patch(
+              `https://api.github.com/repos/${githubOwner}/${githubRepo}/issues/${report.issueNumber}`,
+              {
+                body: updatedBody,
+              },
+              {
+                headers: {
+                  Authorization: `token ${token}`,
+                  Accept: "application/vnd.github.v3+json",
+                },
+              },
+            );
+
+            if (status === ReportStatus.IN_PROGRESS) {
+              const issueResponse = await axios.get(
+                `https://api.github.com/repos/${githubOwner}/${githubRepo}/issues/${report.issueNumber}`,
+                {
+                  headers: {
+                    Authorization: `token ${token}`,
+                    Accept: "application/vnd.github.v3+json",
+                  },
+                },
+              );
+
+              const issueData = issueResponse.data as {
+                labels: Array<{ name: string }>;
+              };
+              const currentLabels = Array.isArray(issueData.labels)
+                ? issueData.labels.map((label: { name: string }) => label.name)
+                : [];
+              if (!currentLabels.includes("in-progress")) {
+                await axios.patch(
+                  `https://api.github.com/repos/${githubOwner}/${githubRepo}/issues/${report.issueNumber}`,
+                  {
+                    labels: [...currentLabels, "in-progress"],
+                  },
+                  {
+                    headers: {
+                      Authorization: `token ${token}`,
+                      Accept: "application/vnd.github.v3+json",
+                    },
+                  },
+                );
+              }
+
+              await axios.post(
+                `https://api.github.com/repos/${githubOwner}/${githubRepo}/issues/${report.issueNumber}/comments`,
+                {
+                  body: `**Status Update:** ${
+                    statusMessage || this.getDefaultStatusMessage(status)
+                  }`,
+                },
+                {
+                  headers: {
+                    Authorization: `token ${token}`,
+                    Accept: "application/vnd.github.v3+json",
+                  },
+                },
+              );
+
+              if (resolution) {
+                await axios.post(
+                  `https://api.github.com/repos/${githubOwner}/${githubRepo}/issues/${report.issueNumber}/comments`,
+                  {
+                    body: `**Resolution:** ${resolution}`,
+                  },
+                  {
+                    headers: {
+                      Authorization: `token ${token}`,
+                      Accept: "application/vnd.github.v3+json",
+                    },
+                  },
+                );
+              }
+            }
+          }
+        }
+      } catch (error) {
+        this.logger.error(
+          `Error updating GitHub issue #${report.issueNumber}`,
+          {
+            reportId: report.id,
+            issueNumber: report.issueNumber,
+            error: error instanceof Error ? error.message : String(error),
+            stack: error instanceof Error ? error.stack : undefined,
+          },
+        );
+      }
+    }
+
+    if (status === ReportStatus.RESOLVED || status === ReportStatus.CLOSED) {
+      await this.updateDuplicateReportsStatus(
+        reportId,
+        status,
+        statusMessage || this.getDefaultStatusMessage(status),
+        closureReason,
+      );
+
+      if (report.duplicateOfReportId) {
+        const parentReport = await this.prisma.report.findUnique({
+          where: { id: report.duplicateOfReportId },
+          select: { status: true },
+        });
+
+        if (
+          parentReport &&
+          (parentReport.status === ReportStatus.OPEN ||
+            parentReport.status === ReportStatus.IN_PROGRESS) &&
+          closureReason === "fixed"
+        ) {
+          await this.updateReportStatus(
+            report.duplicateOfReportId,
+            status,
+            `This issue has been resolved as part of resolving a duplicate issue.`,
+            resolution,
+          );
+        }
+      }
+    }
+
+    return updatedReport;
+  }
+
+  async addCommentToReport(
+    reportId: number,
+    userId: string,
+    comment: string,
+  ): Promise<{ message: string; report: any }> {
+    const report = await this.prisma.report.findUnique({
+      where: { id: reportId },
+    });
+
+    if (!report) {
+      throw new NotFoundException(`Report with ID ${reportId} not found`);
+    }
+
+    if (report.reporterId !== userId) {
+      throw new NotFoundException(`Report with ID ${reportId} not found`);
+    }
+
+    const updatedResolution = report.resolution
+      ? `${
+          report.resolution
+        }\n\n**Comment added ${new Date().toISOString()}:**\n${comment}`
+      : `**Comment added ${new Date().toISOString()}:**\n${comment}`;
+
+    const updatedReport = await this.prisma.report.update({
+      where: { id: reportId },
+      data: {
+        resolution: updatedResolution,
+        updatedAt: new Date(),
+      },
+    });
+
+    if (report.issueNumber) {
+      try {
+        const githubOwner = process.env.GITHUB_OWNER;
+        const githubRepo = process.env.GITHUB_REPO;
+        const token = await this.getInstallationToken();
+
+        if (githubOwner && githubRepo && token) {
+          await axios.post(
+            `https://api.github.com/repos/${githubOwner}/${githubRepo}/issues/${report.issueNumber}/comments`,
+            {
+              body: `**User Comment:**\n${comment}`,
+            },
+            {
+              headers: {
+                Authorization: `Bearer ${token}`,
+                Accept: "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+              },
+            },
+          );
+        }
+      } catch (error) {
+        this.logger.warn(
+          `Failed to add GitHub comment for issue ${
+            report.issueNumber ?? ""
+          }: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
+    return {
+      message: "Your comment has been added to the report.",
+      report: updatedReport,
+    };
+  }
+
+  private async createStatusChangeNotification(
+    reportId: number,
+    newStatus: ReportStatus,
+    statusMessage: string,
+    closureReason?: string,
+  ): Promise<void> {
+    void statusMessage;
+    void closureReason;
+    const report = await this.prisma.report.findUnique({
+      where: { id: reportId },
+      select: {
+        reporterId: true,
+        issueNumber: true,
+        status: true,
+        description: true,
+        issueType: true,
+      },
+    });
+
+    if (!report || report.status === newStatus) return;
+  }
+  /**
+   * Track issue status changes and notify users
+   */
+  async trackStatusChangesAndNotify(
+    reportId: number,
+    newStatus: ReportStatus,
+    statusMessage: string,
+    closureReason?: string,
+  ): Promise<void> {
+    const report = await this.prisma.report.findUnique({
+      where: { id: reportId },
+      select: {
+        reporterId: true,
+        issueNumber: true,
+        status: true,
+        statusMessage: true,
+        description: true,
+        issueType: true,
+        closureReason: true,
+      },
+    });
+
+    if (!report) return;
+
+    if (report.status !== newStatus || report.closureReason !== closureReason) {
+      const user = await this.prisma.userCredential.findUnique({
+        where: { userId: report.reporterId },
+      });
+
+      if (!user?.userId) return;
+
+      await this.prisma.userNotification.create({
+        data: {
+          userId: report.reporterId,
+          type: "ISSUE_STATUS_CHANGE",
+          title: `Issue #${report.issueNumber} Status Update`,
+          message: `Your reported issue has been updated to ${newStatus}${
+            closureReason ? ` (${closureReason})` : ""
+          }.`,
+          metadata: JSON.stringify({
+            reportId,
+            oldStatus: report.status,
+            newStatus,
+            issueNumber: report.issueNumber,
+            statusMessage,
+          }),
+          read: false,
+        },
+      });
+    }
+  }
+
+  private getDefaultStatusMessage(status: ReportStatus): string {
+    switch (status) {
+      case ReportStatus.OPEN: {
+        return "Your issue has been reported and is being reviewed.";
+      }
+      case ReportStatus.IN_PROGRESS: {
+        return "Our team is actively working on this issue.";
+      }
+      case ReportStatus.RESOLVED: {
+        return "This issue has been resolved. Please let us know if you need further assistance.";
+      }
+      case ReportStatus.CLOSED: {
+        return "This issue has been closed without further action.";
+      }
+      default: {
+        return "The status of this issue has been updated.";
+      }
+    }
+  }
+
+  async sendUserFeedback(input: {
+    title: string;
+    description: string;
+    rating: string;
+    userEmail?: string;
+    portalName?: string;
+    portalUrl?: string;
+    userId?: string;
+    assignmentId?: number;
+  }): Promise<{ message: string; reportId?: number }> {
+    const {
+      title,
+      description,
+      rating,
+      userEmail,
+      portalName,
+      portalUrl,
+      userId,
+      assignmentId,
+    } = input;
+
+    // Fire-and-forget: see floService.sendError comment in reportIssue.
+    void this.floService
+      .sendFeedback(title, description, {
+        rating,
+        userEmail,
+        portalName: portalName || "Mark AI Assistant",
+        portalUrl,
+      })
+      .catch((error) => {
+        this.logger.warn(
+          `Flo sendFeedback dispatch failed: ${(error as Error).message}`,
+        );
+      });
+
+    let report: { id: number } | null = null;
+    if (assignmentId) {
+      try {
+        report = await this.prisma.report.create({
+          data: {
+            reporterId: userId || "anonymous",
+            assignmentId,
+            issueType: ReportType.FEEDBACK,
+            description: `Rating: ${rating}\n\n${description}`,
+            author: false,
+            status: ReportStatus.OPEN,
+            statusMessage:
+              "Your feedback has been received and is being reviewed.",
+          },
+        });
+      } catch (error) {
+        this.logger.error("sendUserFeedback: failed to persist feedback", {
+          error: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+          assignment_id: assignmentId,
+        });
+
+        return {
+          message:
+            "We encountered an issue while submitting your feedback. Please try again later.",
+        };
+      }
+    }
+
+    return {
+      message: `Thank you for your feedback! Our team will review it soon.${
+        report
+          ? " You can check the status of this feedback anytime by asking me about your reported issues."
+          : ""
+      }`,
+      reportId: report?.id,
+    };
+  }
+
+  async sendBugRenewalEmail(dto: BugRenewalEmailDto): Promise<{
+    success: boolean;
+    message: string;
+    reportId?: number;
+    skipped?: boolean;
+  }> {
+    const report = await this.prisma.report.findFirst({
+      where: { issueNumber: dto.issueNumber },
+    });
+
+    if (!report) {
+      throw new NotFoundException(
+        `Report with issue number ${dto.issueNumber} not found`,
+      );
+    }
+
+    // Always send to the report's own reporter. The recipient is intentionally
+    // not caller-overridable so an admin/CI token can't direct Mark-branded
+    // mail at arbitrary addresses.
+    const email = report.reporterId;
+    if (!email) {
+      throw new BadRequestException("Reporter email is missing");
+    }
+
+    const ttlSeconds = this.getRenewalTokenTtlSeconds();
+    if (report.renewalEmailSentAt) {
+      const renewalSentAtMs = new Date(
+        String(report.renewalEmailSentAt),
+      ).getTime();
+      const ageMs = Date.now() - renewalSentAtMs;
+      if (ageMs < ttlSeconds * 1000) {
+        return {
+          success: true,
+          skipped: true,
+          reportId: report.id,
+          message: "Renewal email was already sent recently.",
+        };
+      }
+    }
+
+    const issueTitle = this.truncateText(
+      dto.issueTitle || `Issue #${dto.issueNumber}`,
+      160,
+    );
+    const issueBody = this.truncateText(
+      this.extractDevelopmentDetails(
+        dto.issueBody ||
+          report.description ||
+          "No additional details provided.",
+      ),
+      1000,
+    );
+    const reportedAt =
+      dto.reportedAt || report.createdAt?.toISOString?.() || undefined;
+
+    const renewToken = this.generateRenewalToken();
+    const closeToken = this.generateRenewalToken();
+    const renewTokenHash = this.hashRenewalToken(renewToken);
+    const closeTokenHash = this.hashRenewalToken(closeToken);
+    const tokenExpiresAt = new Date(Date.now() + ttlSeconds * 1000);
+
+    const renewLink = this.buildRenewalActionLink("renew", renewToken);
+    const closeLink = this.buildRenewalActionLink("close", closeToken);
+
+    const sent = await this.adminEmailService.sendBugRenewalEmail(
+      email,
+      issueTitle,
+      issueBody,
+      renewLink,
+      closeLink,
+      reportedAt,
+      dto.issueNumber,
+    );
+
+    if (sent) {
+      await this.prisma.report.update({
+        where: { id: report.id },
+        data: {
+          renewalEmailSentAt: new Date(),
+          renewalRenewTokenHash: renewTokenHash,
+          renewalCloseTokenHash: closeTokenHash,
+          renewalTokenExpiresAt: tokenExpiresAt,
+        },
+      });
+    }
+
+    return {
+      success: sent,
+      message: sent
+        ? "Bug renewal email sent successfully."
+        : "Failed to send bug renewal email.",
+      reportId: report.id,
+    };
+  }
+
+  async handleBugRenewalAction(
+    token?: string,
+    action?: string,
+  ): Promise<string> {
+    if (!token || !action) {
+      throw new BadRequestException("Missing token or action");
+    }
+
+    if (action !== "renew" && action !== "close") {
+      throw new BadRequestException("Invalid action");
+    }
+
+    const tokenHash = this.hashRenewalToken(token);
+    const report = await this.prisma.report.findFirst({
+      where:
+        action === "renew"
+          ? { renewalRenewTokenHash: tokenHash }
+          : { renewalCloseTokenHash: tokenHash },
+    });
+
+    if (!report) {
+      throw new NotFoundException("Report not found");
+    }
+
+    if (
+      report.renewalTokenExpiresAt &&
+      report.renewalTokenExpiresAt < new Date()
+    ) {
+      throw new BadRequestException("Token has expired");
+    }
+
+    if (report.renewalActionAt) {
+      return this.buildRenewalActionHtml(
+        "Already processed",
+        "This link has already been used. Thanks for the update!",
+      );
+    }
+
+    if (action === "renew") {
+      if (!report.issueNumber) {
+        throw new BadRequestException("Report is missing issue number");
+      }
+
+      await this.postGithubComment(
+        report.issueNumber,
+        `User confirmed they are still experiencing this issue (via renewal email) on ${new Date().toISOString()}.`,
+      );
+
+      await this.prisma.report.update({
+        where: { id: report.id },
+        data: {
+          renewalActionAt: new Date(),
+          renewalAction: "renew",
+        },
+      });
+
+      return this.buildRenewalActionHtml(
+        "Thanks for confirming",
+        "We've noted that you're still experiencing this issue.",
+      );
+    }
+
+    await this.updateReportStatus(
+      report.id,
+      ReportStatus.CLOSED,
+      "User indicated the issue is resolved.",
+      "User indicated the issue is resolved.",
+    );
+
+    await this.prisma.report.update({
+      where: { id: report.id },
+      data: {
+        renewalActionAt: new Date(),
+        renewalAction: "close",
+      },
+    });
+
+    return this.buildRenewalActionHtml(
+      "Thanks for the update",
+      "We've closed this issue. If it comes back, feel free to report it again.",
+    );
+  }
+
+  private buildRenewalActionHtml(title: string, message: string): string {
+    return `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>${title}</title>
+        <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 0; background-color: #f8fafc; }
+          .container { max-width: 600px; margin: 0 auto; padding: 48px 20px; }
+          .card { background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 32px; text-align: center; }
+          h1 { margin: 0 0 12px; font-size: 24px; color: #0f172a; }
+          p { margin: 0; color: #475569; font-size: 16px; line-height: 1.5; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="card">
+            <h1>${title}</h1>
+            <p>${message}</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+  }
+
+  async addScreenshotToReport(
+    reportId: number,
+    screenshotUrl: string,
+    userId: string,
+    bucket?: string,
+  ) {
+    const report = await this.prisma.report.findUnique({
+      where: { id: reportId },
+    });
+
+    if (!report) {
+      throw new NotFoundException(`Report with ID ${reportId} not found`);
+    }
+
+    if (report.reporterId !== userId) {
+      throw new NotFoundException(`Report with ID ${reportId} not found`);
+    }
+
+    if (report.issueNumber) {
+      try {
+        const token = await this.getInstallationToken();
+        const owner = process.env.GITHUB_OWNER;
+        const repo = process.env.GITHUB_REPO;
+
+        const debugBucket = bucket || process.env.IBM_COS_DEBUG_BUCKET;
+        const cosEndpoint = process.env.IBM_COS_ENDPOINT;
+        const fullScreenshotUrl = `${cosEndpoint}/${debugBucket}/${screenshotUrl}`;
+
+        const commentBody = `
+### Screenshot Added
+
+![Screenshot](${fullScreenshotUrl})
+
+*Screenshot uploaded to IBM Cloud Object Storage: \`${screenshotUrl}\`*
+`;
+
+        await axios.post(
+          `https://api.github.com/repos/${owner}/${repo}/issues/${report.issueNumber}/comments`,
+          {
+            body: commentBody,
+          },
+          {
+            headers: {
+              Authorization: `token ${token}`,
+              Accept: "application/vnd.github.v3+json",
+            },
+          },
+        );
+      } catch (error) {
+        this.logger.warn(
+          `Failed to add screenshot comment for issue ${
+            report.issueNumber ?? ""
+          }: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
+    const currentComments = report.comments || "";
+    const screenshotComment = `\n[Screenshot: ${screenshotUrl}]`;
+
+    await this.prisma.report.update({
+      where: { id: reportId },
+      data: {
+        comments: currentComments + screenshotComment,
+        updatedAt: new Date(),
+      },
+    });
+
+    return {
+      success: true,
+      message: "Screenshot added to report successfully",
+      screenshotUrl,
+    };
+  }
+}
