@@ -24,6 +24,7 @@ const search = ref('')
 const studentPage = ref(1)
 const classSaving = ref(false)
 const studentSaving = ref(false)
+const transferSaving = ref(false)
 const importBusy = ref(false)
 
 const classForm = reactive({ name: '', grade: '初一' })
@@ -31,11 +32,18 @@ const classCreateForm = reactive({ name: '', grade: '初一' })
 const studentForm = reactive({ studentNo: '', name: '' })
 const classOpen = ref(false)
 const studentOpen = ref(false)
+const transferOpen = ref(false)
 const classError = ref('')
 const studentError = ref('')
+const transferError = ref('')
+const transferStudentTarget = ref<StudentSummary | null>(null)
+const transferTargetClassId = ref<number | null>(null)
 
 const selectedClass = computed(
   () => classes.value.find((item) => item.id === selectedClassId.value) ?? null,
+)
+const transferClasses = computed(() =>
+  classes.value.filter((item) => item.id !== selectedClassId.value),
 )
 const filteredStudents = computed(() => {
   const keyword = search.value.trim().toLowerCase()
@@ -163,6 +171,13 @@ function openStudentCreate(): void {
   studentOpen.value = true
 }
 
+function openStudentTransfer(student: StudentSummary): void {
+  transferError.value = ''
+  transferStudentTarget.value = student
+  transferTargetClassId.value = transferClasses.value[0]?.id ?? null
+  transferOpen.value = true
+}
+
 async function createStudent(): Promise<void> {
   if (!selectedClassId.value) return
   studentError.value = ''
@@ -207,6 +222,45 @@ async function toggleStudentStatus(student: StudentSummary): Promise<void> {
     await refreshClassCount()
   } catch (cause) {
     ui.toast('error', '更新学生失败', errorMessage(cause))
+  }
+}
+
+async function transferStudent(): Promise<void> {
+  if (
+    !selectedClassId.value ||
+    !selectedClass.value ||
+    !transferStudentTarget.value ||
+    !transferTargetClassId.value
+  ) {
+    transferError.value = '请选择目标班级。'
+    return
+  }
+  const targetClass = classes.value.find(
+    (item) => item.id === transferTargetClassId.value,
+  )
+  if (!targetClass) {
+    transferError.value = '目标班级不存在，请刷新后重试。'
+    return
+  }
+  transferSaving.value = true
+  transferError.value = ''
+  try {
+    const result = await teacherApi.transferStudent(
+      selectedClassId.value,
+      transferStudentTarget.value.id,
+      targetClass.id,
+    )
+    transferOpen.value = false
+    ui.toast(
+      'success',
+      '学生已转班',
+      `${result.name} 已从 ${result.fromClassName} 转到 ${result.targetClassName}，历史成绩和讲评记录已保留。`,
+    )
+    await loadClasses(result.targetClassId)
+  } catch (cause) {
+    transferError.value = errorMessage(cause)
+  } finally {
+    transferSaving.value = false
   }
 }
 
@@ -416,9 +470,14 @@ onMounted(() => {
             <span class="badge" :data-tone="student.status === 'DISABLED' ? 'apricot' : 'mint'">
               {{ student.status === 'DISABLED' ? '已停用' : '在读' }}
             </span>
-            <button class="btn btn--ghost btn--xs" type="button" @click="toggleStudentStatus(student)">
-              {{ student.status === 'DISABLED' ? '恢复' : '停用' }}
-            </button>
+            <div class="student-row-actions">
+              <button class="btn btn--quiet btn--xs" type="button" @click="openStudentTransfer(student)">
+                转班
+              </button>
+              <button class="btn btn--ghost btn--xs" type="button" @click="toggleStudentStatus(student)">
+                {{ student.status === 'DISABLED' ? '恢复' : '停用' }}
+              </button>
+            </div>
           </div>
           <AppPagination
             v-model:page="studentPage"
@@ -457,7 +516,7 @@ onMounted(() => {
       </template>
     </AppModal>
 
-    <AppModal v-model="studentOpen" title="添加学生" subtitle="学生使用虚构学号与姓名；登录账号绑定不在本页处理。" size="sm">
+    <AppModal v-model="studentOpen" title="添加学生账号" subtitle="添加后立即创建学生登录账号，账号就是学号。" size="sm">
       <div class="stack-form">
         <label class="field">
           <span>学号</span>
@@ -467,11 +526,61 @@ onMounted(() => {
           <span>姓名</span>
           <input v-model="studentForm.name" class="input" maxlength="64" placeholder="例：虚构学生99" />
         </label>
+        <div class="account-hint">
+          <AppIcon name="shield" :size="14" />
+          <p>初始密码固定为 <b>123456</b>。学生下次登录使用“学生”入口，无需另外注册。</p>
+        </div>
         <div v-if="studentError" class="error-banner">{{ studentError }}</div>
       </div>
       <template #footer>
         <button class="btn btn--ghost" type="button" @click="studentOpen = false">取消</button>
-        <button class="btn btn--primary" type="button" :disabled="studentSaving" @click="createStudent">添加学生</button>
+        <button class="btn btn--primary" type="button" :disabled="studentSaving" @click="createStudent">创建账号</button>
+      </template>
+    </AppModal>
+
+    <AppModal
+      v-model="transferOpen"
+      title="学生转班"
+      subtitle="转班只改变学生当前所属班级，不删除历史作业、成绩、讲评和订正。"
+      size="sm"
+    >
+      <div v-if="transferStudentTarget" class="stack-form">
+        <div class="transfer-student">
+          <span class="avatar avatar--sm">{{ transferStudentTarget.name.slice(0, 1) }}</span>
+          <div>
+            <b>{{ transferStudentTarget.name }}</b>
+            <span>{{ transferStudentTarget.studentNo }}</span>
+          </div>
+          <AppIcon name="arrow-right" :size="16" />
+          <strong>{{ selectedClass?.name }}</strong>
+        </div>
+        <label class="field">
+          <span>转入班级</span>
+          <select v-model="transferTargetClassId" class="select" :disabled="!transferClasses.length">
+            <option v-if="!transferClasses.length" :value="null">没有其他可转入班级</option>
+            <option v-for="item in transferClasses" :key="item.id" :value="item.id">
+              {{ item.name }} · {{ item.studentCount }} 人
+            </option>
+          </select>
+        </label>
+        <div class="account-hint">
+          <AppIcon name="info" :size="14" />
+          <p>
+            转班后学生将从原班级名单中消失，并出现在目标班级。原班级历史数据仍保留；需要先新建另一个班级才能转班。
+          </p>
+        </div>
+        <div v-if="transferError" class="error-banner">{{ transferError }}</div>
+      </div>
+      <template #footer>
+        <button class="btn btn--ghost" type="button" @click="transferOpen = false">取消</button>
+        <button
+          class="btn btn--primary"
+          type="button"
+          :disabled="transferSaving || !transferTargetClassId"
+          @click="transferStudent"
+        >
+          {{ transferSaving ? '转班中…' : '确认转班' }}
+        </button>
       </template>
     </AppModal>
   </div>
@@ -676,7 +785,7 @@ onMounted(() => {
 .student-table-head,
 .student-table-row {
   display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(120px, 0.8fr) 90px 70px;
+  grid-template-columns: minmax(0, 1.2fr) minmax(120px, 0.8fr) 90px minmax(132px, auto);
   gap: 10px;
   align-items: center;
 }
@@ -706,6 +815,73 @@ onMounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.student-row-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.account-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 10px 11px;
+  border-radius: 10px;
+  color: var(--ink-3);
+  background: var(--surface-soft);
+  font-size: 11.5px;
+  line-height: 1.65;
+}
+
+.account-hint .icon {
+  flex: none;
+  margin-top: 1px;
+  color: var(--role);
+}
+
+.account-hint b {
+  color: var(--ink-2);
+}
+
+.transfer-student {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-soft);
+}
+
+.transfer-student > div {
+  min-width: 0;
+  flex: 1;
+}
+
+.transfer-student b,
+.transfer-student span {
+  display: block;
+}
+
+.transfer-student b,
+.transfer-student strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.transfer-student span {
+  margin-top: 1px;
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+}
+
+.transfer-student > .icon {
+  flex: none;
+  color: var(--ink-4);
 }
 
 .mono {
@@ -738,9 +914,14 @@ onMounted(() => {
     grid-template-columns: minmax(0, 1fr) minmax(90px, 0.7fr) 70px;
   }
 
-  .student-table-head span:last-child,
-  .student-table-row > :last-child {
+  .student-table-head span:last-child {
     display: none;
+  }
+
+  .student-row-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-end;
+    padding-top: 2px;
   }
 }
 </style>

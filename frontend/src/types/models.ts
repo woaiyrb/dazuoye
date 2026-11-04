@@ -59,6 +59,14 @@ export interface StudentSummary {
   status?: UserStatus
 }
 
+export interface StudentTransferResult extends StudentSummary {
+  fromClassId: number
+  fromClassName: string
+  targetClassId: number
+  targetClassName: string
+  previousStatus?: UserStatus
+}
+
 export type QuestionType = 'SINGLE_CHOICE' | 'TRUE_FALSE'
 export type HomeworkStatus = 'DRAFT' | 'PUBLISHED' | 'ARCHIVED'
 export type HandoutStatus = 'UNPUBLISHED' | 'PUBLISHED' | 'WITHDRAWN'

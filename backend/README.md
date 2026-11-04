@@ -49,6 +49,7 @@ Flyway 迁移位于 `src/main/resources/db/migration`，启动时自动执行。
 
 - `POST /api/auth/session`：三端登录。
 - `GET/POST /api/teacher/classes`：班级与学生管理。
+- `POST /api/teacher/classes/{classId}/students/{studentId}/transfer`：学生转班，保留历史记录。
 - `GET/POST /api/teacher/homeworks`：作业与题目管理。
 - `POST /api/teacher/homeworks/{id}/ai-questions/generate`：DeepTutor 候选题。
 - `POST /api/teacher/homeworks/{id}/handouts/generate`：AI 讲评草稿。

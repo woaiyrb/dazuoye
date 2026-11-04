@@ -4,6 +4,7 @@ import java.util.Map;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
+import org.apache.ibatis.annotations.Update;
 
 @Mapper
 public interface TeacherWorkflowMapper {
@@ -31,4 +32,16 @@ public interface TeacherWorkflowMapper {
     Map<String, Object> selectLatestAiDraft(
             @Param("homeworkId") int homeworkId,
             @Param("questionId") int questionId);
+
+    @Update("""
+            UPDATE app_user
+            SET classId = #{targetClassId}
+            WHERE id = #{studentId}
+              AND classId = #{sourceClassId}
+              AND role = 'STUDENT'
+            """)
+    int transferStudent(
+            @Param("studentId") int studentId,
+            @Param("sourceClassId") int sourceClassId,
+            @Param("targetClassId") int targetClassId);
 }

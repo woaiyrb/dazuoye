@@ -27,6 +27,7 @@ import type {
   QuestionCorrectionProgress,
   QuestionType,
   StudentSummary,
+  StudentTransferResult,
 } from '@/types/models'
 import { isMockMode, request } from './client'
 
@@ -126,6 +127,14 @@ export const teacherApi = {
     return request<StudentSummary>('PUT', `/teacher/classes/${classId}/students/${studentId}`, {
       data: payload,
     })
+  },
+
+  transferStudent(classId: number, studentId: number, targetClassId: number) {
+    return request<StudentTransferResult>(
+      'POST',
+      `/teacher/classes/${classId}/students/${studentId}/transfer`,
+      { data: { targetClassId } },
+    )
   },
 
   importStudents(classId: number, rows: Array<{ studentNo: string; name: string }>) {

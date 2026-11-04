@@ -80,6 +80,52 @@ test('teacher can create a class and submit a template with the real backend', a
   await expect(page.getByText(templateTitle, { exact: true })).toBeVisible()
 })
 
+test('teacher can create a student account and transfer the student', async ({ page }) => {
+  const suffix = Date.now()
+  const sourceClass = `转班源班-${suffix}`
+  const targetClass = `转班目标班-${suffix}`
+  const studentNo = `E2E-TRANSFER-${suffix}`
+  await login(page, '教师')
+  await page.goto('/teacher/classes')
+
+  for (const className of [sourceClass, targetClass]) {
+    await page.getByRole('button', { name: '新建班级' }).click()
+    const dialog = page.getByRole('dialog', { name: '新建班级' })
+    await dialog.getByLabel('班级名称').fill(className)
+    await dialog.getByLabel('年级').fill('七年级')
+    await dialog.getByRole('button', { name: '创建班级' }).click()
+    await expect(page.getByText(className, { exact: true })).toBeVisible()
+  }
+
+  const classSelect = page.locator('.class-select select')
+  const sourceValue = await classSelect
+    .locator('option')
+    .filter({ hasText: sourceClass })
+    .getAttribute('value')
+  const targetValue = await classSelect
+    .locator('option')
+    .filter({ hasText: targetClass })
+    .getAttribute('value')
+  await classSelect.selectOption(sourceValue!)
+
+  await page.locator('.student-actions').getByRole('button', { name: '添加学生' }).click()
+  const accountDialog = page.getByRole('dialog', { name: '添加学生账号' })
+  await accountDialog.getByLabel('学号').fill(studentNo)
+  await accountDialog.getByLabel('姓名').fill('E2E 转班学生')
+  await accountDialog.getByRole('button', { name: '创建账号' }).click()
+  await expect(page.getByText('学生已添加')).toBeVisible()
+
+  const studentRow = page.locator('.student-table-row').filter({ hasText: studentNo })
+  await expect(studentRow).toBeVisible()
+  await studentRow.getByRole('button', { name: '转班' }).click()
+  const transferDialog = page.getByRole('dialog', { name: '学生转班' })
+  await transferDialog.getByLabel('转入班级').selectOption(targetValue!)
+  await transferDialog.getByRole('button', { name: '确认转班' }).click()
+  await expect(page.getByText('学生已转班')).toBeVisible()
+  await expect(classSelect).toHaveValue(targetValue!)
+  await expect(page.locator('.student-table-row').filter({ hasText: studentNo })).toBeVisible()
+})
+
 test('student sees own handouts and research opens audit logs', async ({ page }) => {
   await login(page, '学生')
   await expect(page.getByRole('heading', { level: 1 })).toBeVisible()

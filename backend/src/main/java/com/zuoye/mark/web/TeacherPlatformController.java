@@ -95,6 +95,19 @@ public class TeacherPlatformController {
                 body);
     }
 
+    @PostMapping("/classes/{classId}/students/{studentId}/transfer")
+    public Map<String, Object> transferStudent(
+            @PathVariable int classId,
+            @PathVariable int studentId,
+            @RequestBody JsonNode body,
+            HttpServletRequest request) {
+        return service.transferStudent(
+                teacher(request).id(),
+                classId,
+                studentId,
+                body);
+    }
+
     @PostMapping("/classes/{classId}/students/import")
     public Map<String, Object> importStudents(
             @PathVariable int classId,

@@ -210,6 +210,47 @@ public class TeacherPlatformService {
     }
 
     @Transactional
+    public Map<String, Object> transferStudent(
+            int teacherId,
+            int classId,
+            int studentId,
+            JsonNode body) {
+        requireClass(teacherId, classId);
+        int targetClassId = integer(body, "targetClassId", 0);
+        if (targetClassId <= 0) {
+            throw new PlatformException(
+                    HttpStatus.UNPROCESSABLE_ENTITY,
+                    "TARGET_CLASS_REQUIRED",
+                    "请选择目标班级。");
+        }
+        if (targetClassId == classId) {
+            throw new PlatformException(
+                    HttpStatus.UNPROCESSABLE_ENTITY,
+                    "SAME_CLASS",
+                    "学生已经在当前班级。");
+        }
+        requireClass(teacherId, targetClassId);
+        Map<String, Object> sourceStudent = studentById(classId, studentId);
+        int changed = workflowMapper.transferStudent(
+                studentId,
+                classId,
+                targetClassId);
+        if (changed == 0) {
+            throw notFound("学生不存在或已不在原班级。");
+        }
+        Map<String, Object> result = new LinkedHashMap<>(
+                studentById(targetClassId, studentId));
+        result.put("fromClassId", classId);
+        result.put("fromClassName", classById(teacherId, classId).get("name"));
+        result.put("targetClassId", targetClassId);
+        result.put(
+                "targetClassName",
+                classById(teacherId, targetClassId).get("name"));
+        result.put("previousStatus", sourceStudent.get("status"));
+        return result;
+    }
+
+    @Transactional
     public Map<String, Object> importStudents(
             int teacherId,
             int classId,
