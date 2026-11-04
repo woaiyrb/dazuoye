@@ -1,0 +1,34 @@
+{
+  "name": "mistake-planet-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "错题星球 · 数学讲评与错题跟踪助手（Vue 3 前端）",
+  "scripts": {
+    "dev": "vite",
+    "dev:http": "vite --mode http",
+    "build": "vue-tsc -b && vite build && node scripts/precompress.mjs",
+    "build:http": "vue-tsc -b && vite build --mode http && node scripts/precompress.mjs",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc -b",
+    "test:e2e": "playwright test",
+    "test:e2e:headed": "playwright test --headed",
+    "test:screenshots": "playwright test e2e/smoke.spec.ts"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "pinia": "^3.0.1",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.1",
+    "@tsconfig/node22": "^22.0.0",
+    "@types/node": "^22.10.7",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "@vue/tsconfig": "^0.7.0",
+    "typescript": "~5.7.2",
+    "vite": "^6.1.0",
+    "vue-tsc": "^2.2.0"
+  }
+}

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#f3f8f5" />
+    <meta name="description" content="错题星球：面向初中数学教师的作业讲评与错题跟踪助手。批改导入、错误统计、AI 草稿审核、教师发布、学生订正闭环。" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <title>错题星球 · 数学讲评助手</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      if (location.protocol === 'file:') {
+        document.body.innerHTML = `
+          <main style="min-height:100vh;display:grid;place-items:center;padding:24px;background:#f3f8f5;color:#20332d;font-family:'Microsoft YaHei','PingFang SC',sans-serif">
+            <section style="width:min(620px,100%);padding:34px;border:1px solid #e4eee9;border-radius:24px;background:#fff;box-shadow:0 24px 60px -36px rgba(44,82,70,.35)">
+              <p style="margin:0 0 10px;color:#177f78;font-size:12px;font-weight:700;letter-spacing:.14em">MISTAKE PLANET · LOCAL PREVIEW</p>
+              <h1 style="margin:0;font-size:30px;font-weight:600;line-height:1.35">请通过开发服务器打开</h1>
+              <p style="margin:14px 0 0;color:#536862;font-size:14px;line-height:1.85">
+                当前地址以 <code style="padding:2px 6px;border-radius:5px;background:#f1f6f4">file://</code> 开头，浏览器无法加载 Vite 的 TypeScript 模块，因此页面会显示空白。
+              </p>
+              <div style="margin-top:20px;padding:16px 18px;border-radius:12px;background:#f8fbf9;color:#20332d;font-size:13px;line-height:2">
+                <div>方式一：双击目录中的 <b>启动前端.bat</b></div>
+                <div>方式二：在此目录运行 <code>npm run dev</code></div>
+                <div style="margin-top:6px;color:#177f78">然后访问：http://127.0.0.1:5173</div>
+              </div>
+              <p style="margin:16px 0 0;color:#879b94;font-size:12px;line-height:1.7">这是 Vite 项目的正常限制，不是页面代码故障。构建产物请使用 <code>npm run preview</code> 或任意静态服务器访问。</p>
+            </section>
+          </main>`
+      }
+    </script>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

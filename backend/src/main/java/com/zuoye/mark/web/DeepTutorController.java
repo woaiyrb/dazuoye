@@ -1,0 +1,35 @@
+package com.zuoye.mark.web;
+
+import com.zuoye.mark.service.DeepTutorClient;
+import java.time.Instant;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/java-api/ai")
+public class DeepTutorController {
+
+    private final DeepTutorClient deepTutor;
+
+    public DeepTutorController(DeepTutorClient deepTutor) {
+        this.deepTutor = deepTutor;
+    }
+
+    @GetMapping("/status")
+    public Map<String, Object> status() {
+        Map<String, Object> readiness = deepTutor.readiness();
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("backend", "ok");
+        result.put("javaVersion", System.getProperty("java.version"));
+        result.put("architecture", "vue-java-mysql");
+        result.put("deepTutorState", readiness.get("state"));
+        result.put("deepTutorReady", Boolean.TRUE.equals(readiness.get("ready")));
+        result.put("deepTutor", readiness);
+        result.put("checkedAt", Instant.now().toString());
+        return result;
+    }
+
+}
