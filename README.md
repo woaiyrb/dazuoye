@@ -6,7 +6,7 @@
 
 ```text
 frontend/   Vue 3 + TypeScript + CSS
-backend/    Java 17 + Spring Boot
+backend/    Java 17 + Spring Boot + MyBatis
 database/   MySQL 8 表结构、迁移与演示数据
 scripts/    本地启动和数据库验收脚本
 ```

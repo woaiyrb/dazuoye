@@ -2,6 +2,7 @@ package com.zuoye.mark.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.zuoye.mark.mapper.TeacherWorkflowMapper;
 import java.math.BigDecimal;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
@@ -30,18 +31,21 @@ public class TeacherPlatformService {
     private final PasswordService passwordService;
     private final DeepTutorClient deepTutor;
     private final CommentaryTextService commentaryText;
+    private final TeacherWorkflowMapper workflowMapper;
 
     public TeacherPlatformService(
             JdbcTemplate jdbcTemplate,
             ObjectMapper objectMapper,
             PasswordService passwordService,
             DeepTutorClient deepTutor,
-            CommentaryTextService commentaryText) {
+            CommentaryTextService commentaryText,
+            TeacherWorkflowMapper workflowMapper) {
         this.jdbcTemplate = jdbcTemplate;
         this.objectMapper = objectMapper;
         this.passwordService = passwordService;
         this.deepTutor = deepTutor;
         this.commentaryText = commentaryText;
+        this.workflowMapper = workflowMapper;
     }
 
     public List<Map<String, Object>> listClasses(int teacherId) {
@@ -402,6 +406,7 @@ public class TeacherPlatformService {
                 teacherId,
                 homeworkId,
                 integer(body, "expectedVersion", -1));
+        requireHomeworkEditable(teacherId, homeworkId);
         jdbcTemplate.update(
                 """
                 UPDATE course_homework
@@ -476,7 +481,7 @@ public class TeacherPlatformService {
             int teacherId,
             int homeworkId,
             JsonNode body) {
-        requireHomework(teacherId, homeworkId);
+        requireHomeworkEditable(teacherId, homeworkId);
         int seqNo = integer(body, "seqNo", nextQuestionSeq(homeworkId));
         String type = normalizeQuestionType(text(body, "questionType", ""));
         String stem = requiredText(body, "stem", "题干不能为空。");
@@ -528,7 +533,7 @@ public class TeacherPlatformService {
             JsonNode body) {
         Map<String, Object> question = questionById(questionId);
         int homeworkId = ((Number) question.get("homeworkId")).intValue();
-        requireHomework(teacherId, homeworkId);
+        requireHomeworkEditable(teacherId, homeworkId);
         int expectedRevision = integer(body, "expectedRevisionNo", -1);
         int currentRevision = ((Number) question.get("revisionNo")).intValue();
         if (expectedRevision >= 0 && expectedRevision != currentRevision) {
@@ -567,7 +572,7 @@ public class TeacherPlatformService {
             int questionId) {
         Map<String, Object> question = questionById(questionId);
         int homeworkId = ((Number) question.get("homeworkId")).intValue();
-        requireHomework(teacherId, homeworkId);
+        requireHomeworkEditable(teacherId, homeworkId);
         jdbcTemplate.update(
                 """
                 UPDATE course_question
@@ -647,7 +652,7 @@ public class TeacherPlatformService {
             int teacherId,
             int homeworkId,
             JsonNode body) {
-        requireHomework(teacherId, homeworkId);
+        requireHomeworkEditable(teacherId, homeworkId);
         List<Map<String, Object>> rows = new ArrayList<>();
         JsonNode inputRows = body.path("rows");
         if (!inputRows.isArray() || inputRows.isEmpty()) {
@@ -656,14 +661,35 @@ public class TeacherPlatformService {
                     "EMPTY_IMPORT",
                     "没有可导入的批改记录。");
         }
-        for (JsonNode row : inputRows) {
-            String studentNo = requiredText(row, "studentNo", "学号不能为空。");
+        List<Map<String, Object>> validationErrors = new ArrayList<>();
+        for (int index = 0; index < inputRows.size(); index++) {
+            JsonNode row = inputRows.get(index);
+            String studentNo = text(row, "studentNo", "").trim();
             int seq = integer(row, "seqNo", 0);
+            int rowNumber = index + 2;
+            if (studentNo.isBlank()) {
+                validationErrors.add(importRowError(
+                        rowNumber,
+                        "studentNo",
+                        "缺少学生标识",
+                        ""));
+            }
             if (seq < 1) {
-                throw new PlatformException(
-                        HttpStatus.UNPROCESSABLE_ENTITY,
-                        "INVALID_SEQ",
-                        "题号必须大于 0。");
+                validationErrors.add(importRowError(
+                        rowNumber,
+                        "questionSeq",
+                        "题号必须大于 0",
+                        row.path("seqNo").asText("")));
+            }
+            JsonNode correctNode = row.get("isCorrect");
+            if (correctNode == null
+                    || correctNode.isNull()
+                    || !correctNode.isBoolean()) {
+                validationErrors.add(importRowError(
+                        rowNumber,
+                        "isCorrect",
+                        "缺少对错结果",
+                        correctNode == null ? "" : correctNode.asText()));
             }
             Map<String, Object> normalized = new LinkedHashMap<>();
             normalized.put("studentNo", studentNo);
@@ -675,6 +701,13 @@ public class TeacherPlatformService {
             normalized.put("errorTag", text(row, "errorTag", null));
             rows.add(normalized);
         }
+        if (!validationErrors.isEmpty()) {
+            throw new PlatformException(
+                    HttpStatus.UNPROCESSABLE_ENTITY,
+                    "IMPORT_VALIDATION_FAILED",
+                    "批改数据存在无效行。",
+                    Map.of("rowErrors", validationErrors));
+        }
         return persistBatch(
                 teacherId,
                 homeworkId,
@@ -684,6 +717,19 @@ public class TeacherPlatformService {
                 false);
     }
 
+    private Map<String, Object> importRowError(
+            int rowNumber,
+            String field,
+            String message,
+            String rejectedValue) {
+        Map<String, Object> error = new LinkedHashMap<>();
+        error.put("rowNumber", rowNumber);
+        error.put("field", field);
+        error.put("message", message);
+        error.put("rejectedValue", rejectedValue);
+        return error;
+    }
+
     @Transactional
     public Map<String, Object> createImportedBatch(
             int teacherId,
@@ -691,7 +737,7 @@ public class TeacherPlatformService {
             List<Map<String, Object>> rows,
             String source,
             String remark) {
-        requireHomework(teacherId, homeworkId);
+        requireHomeworkEditable(teacherId, homeworkId);
         return persistBatch(
                 teacherId,
                 homeworkId,
@@ -719,7 +765,7 @@ public class TeacherPlatformService {
         }
         Map<String, Object> source = rows.get(0);
         int homeworkId = ((Number) source.get("homeworkId")).intValue();
-        requireHomework(teacherId, homeworkId);
+        requireHomeworkEditable(teacherId, homeworkId);
         int batchId = ((Number) source.get("batchId")).intValue();
         List<Map<String, Object>> allRows = jdbcTemplate.queryForList(
                 """
@@ -1045,9 +1091,9 @@ public class TeacherPlatformService {
                             Statement.RETURN_GENERATED_KEYS);
                     statement.setInt(1, handoutId);
                     statement.setInt(2, questionId);
-                    statement.setString(3, "FAILED".equals(finalDraftStatus)
-                            ? "AI_FAILED_MANUAL"
-                            : "PENDING_REVIEW");
+                    statement.setString(
+                            3,
+                            handoutItemStatus(finalDraftStatus));
                     statement.setInt(4, finalSortNo);
                     return statement;
                 }, keyHolder);
@@ -1063,9 +1109,7 @@ public class TeacherPlatformService {
                             excludeReason = NULL
                         WHERE id = ?
                         """,
-                        "FAILED".equals(finalDraftStatus)
-                                ? "AI_FAILED_MANUAL"
-                                : "PENDING_REVIEW",
+                        handoutItemStatus(finalDraftStatus),
                         sortNo,
                         itemId);
             }
@@ -1145,6 +1189,16 @@ public class TeacherPlatformService {
             Map<String, Object> row,
             String templateContent) {
         long started = System.nanoTime();
+        String standardAnswer = value(row.get("standardAnswer"));
+        String teacherAnalysis = value(row.get("teacherAnalysis"));
+        if (isBlank(standardAnswer) && isBlank(teacherAnalysis)) {
+            return new CommentaryDraft(
+                    row,
+                    "依据不足：请教师补充标准答案或教师解析，或直接手工填写讲评。",
+                    "INSUFFICIENT_EVIDENCE",
+                    "MISSING_EVIDENCE",
+                    (System.nanoTime() - started) / 1_000_000);
+        }
         try {
             String templateSection = templateContent == null
                             || templateContent.isBlank()
@@ -1187,6 +1241,14 @@ public class TeacherPlatformService {
         }
     }
 
+    private String handoutItemStatus(String draftStatus) {
+        return switch (draftStatus) {
+            case "FAILED" -> "AI_FAILED_MANUAL";
+            case "INSUFFICIENT_EVIDENCE" -> "INSUFFICIENT_EVIDENCE";
+            default -> "DRAFT";
+        };
+    }
+
     private String commentaryTemplate(JsonNode body) {
         if (body == null
                 || !body.has("templateId")
@@ -1223,6 +1285,7 @@ public class TeacherPlatformService {
                     "EMPTY_COMMENTARY",
                     "讲评内容不能为空。");
         }
+        requireCommentaryLength(content);
         int versionNo = nextItemVersion(itemId);
         GeneratedKeyHolder keyHolder = new GeneratedKeyHolder();
         String finalContent = content;
@@ -1264,6 +1327,7 @@ public class TeacherPlatformService {
             JsonNode body) {
         requireTeacherItem(teacherId, itemId);
         String content = requiredText(body, "content", "讲评内容不能为空。");
+        requireCommentaryLength(content);
         int versionNo = nextItemVersion(itemId);
         GeneratedKeyHolder keyHolder = new GeneratedKeyHolder();
         jdbcTemplate.update(connection -> {
@@ -1319,9 +1383,20 @@ public class TeacherPlatformService {
             int teacherId,
             int itemId) {
         Map<String, Object> item = requireTeacherItem(teacherId, itemId);
-        String stem = String.valueOf(item.get("stem"));
-        String answer = String.valueOf(item.get("standardAnswer"));
-        String analysis = String.valueOf(item.get("teacherAnalysis"));
+        String stem = value(item.get("stem"));
+        String answer = value(item.get("standardAnswer"));
+        String analysis = value(item.get("teacherAnalysis"));
+        if (isBlank(answer) && isBlank(analysis)) {
+            jdbcTemplate.update(
+                    """
+                    UPDATE handout_item
+                    SET status = 'INSUFFICIENT_EVIDENCE', source = 'AI',
+                        confirmedBy = NULL, confirmedAt = NULL
+                    WHERE id = ?
+                    """,
+                    itemId);
+            return itemById(itemId);
+        }
         String content;
         try {
             content = commentaryText.toReadable(deepTutor.chat("""
@@ -1331,19 +1406,16 @@ public class TeacherPlatformService {
                     教师解析：%s
                     """.formatted(stem, answer, analysis)));
         } catch (Exception error) {
-            throw new PlatformException(
-                    HttpStatus.SERVICE_UNAVAILABLE,
-                    "AI_UNAVAILABLE",
-                    "AI 重新生成失败，请继续手工编辑。");
+            jdbcTemplate.update(
+                    """
+                    UPDATE handout_item
+                    SET status = 'AI_FAILED_MANUAL', source = 'AI',
+                        confirmedBy = NULL, confirmedAt = NULL
+                    WHERE id = ?
+                    """,
+                    itemId);
+            return itemById(itemId);
         }
-        jdbcTemplate.update(
-                """
-                UPDATE handout_item
-                SET status = 'PENDING_REVIEW', source = 'AI',
-                    confirmedBy = NULL, confirmedAt = NULL
-                WHERE id = ?
-                """,
-                itemId);
         JsonNode payload = objectMapper.createObjectNode()
                 .put("content", content)
                 .put("changeNote", "AI 重新生成");
@@ -1428,6 +1500,14 @@ public class TeacherPlatformService {
                 SET status = 'WITHDRAWN', withdrawnAt = CURRENT_TIMESTAMP(3),
                     version = version + 1
                 WHERE id = ?
+                """,
+                handoutId);
+        jdbcTemplate.update(
+                """
+                UPDATE handout_item
+                SET status = 'PENDING_REVIEW',
+                    confirmedBy = NULL, confirmedAt = NULL
+                WHERE handoutId = ? AND status = 'READY'
                 """,
                 handoutId);
         return handoutDetail(handoutId);
@@ -1691,7 +1771,7 @@ public class TeacherPlatformService {
         Map<String, Object> summary = handoutSummary(handoutId);
         List<Map<String, Object>> items = jdbcTemplate.query(
                 """
-                SELECT hi.*, q.seqNo, q.questionType, q.stem, q.options,
+                SELECT hi.*, h.homeworkId, q.seqNo, q.questionType, q.stem, q.options,
                        q.standardAnswer, q.teacherAnalysis, q.score,
                        v.content, v.versionNo,
                        (SELECT COUNT(*) FROM handout_item_version viv
@@ -1744,11 +1824,9 @@ public class TeacherPlatformService {
                             row.getInt("pendingReviewCount"));
                     item.put("blockedCount", row.getInt("blockedCount"));
                     item.put("excludedCount", row.getInt("excludedCount"));
-                    int active = row.getInt("itemCount") - row.getInt("excludedCount");
                     int ready = row.getInt("readyCount");
                     List<String> reasons = new ArrayList<>();
-                    if (active == 0) reasons.add("没有可发布的讲评条目");
-                    if (ready < active) reasons.add("仍有讲评条目未确认");
+                    if (ready == 0) reasons.add("没有可发布的讲评条目");
                     item.put("publishable", reasons.isEmpty());
                     item.put("blockingReasons", reasons);
                     item.put("publishedAt", instant(row.getTimestamp("publishedAt")));
@@ -1794,16 +1872,115 @@ public class TeacherPlatformService {
             actions.add("REGENERATE");
         }
         item.put("allowedActions", actions);
-        item.put("evidence", List.of());
-        item.put("draft", null);
+        int homeworkId = row.getInt("homeworkId");
+        int questionId = row.getInt("questionId");
+        Map<String, Object> draft = workflowMapper.selectLatestAiDraft(
+                homeworkId,
+                questionId);
+        List<Map<String, Object>> evidence = itemEvidence(
+                row,
+                draft);
+        item.put("evidence", evidence);
+        item.put("draft", teacherDraft(draft, evidence));
         item.put("wrongCount", row.getInt("wrongCount"));
+        return item;
+    }
+
+    private List<Map<String, Object>> itemEvidence(
+            java.sql.ResultSet row,
+            Map<String, Object> draft) throws java.sql.SQLException {
+        LinkedHashMap<String, Map<String, Object>> evidence =
+                new LinkedHashMap<>();
+        if (draft != null) {
+            Object raw = draft.get("evidence");
+            Object parsed = parseJson(raw == null ? null : String.valueOf(raw));
+            if (parsed instanceof List<?> list) {
+                for (Object entry : list) {
+                    if (!(entry instanceof Map<?, ?> values)) continue;
+                    String type = value(values.get("evidenceType"));
+                    String text = value(values.get("snapshotText"));
+                    if (isBlank(type) || isBlank(text)) continue;
+                    Map<String, Object> normalized = new LinkedHashMap<>();
+                    normalized.put("evidenceType", type);
+                    normalized.put("snapshotText", text);
+                    evidence.put(type + "|" + text, normalized);
+                }
+            }
+        }
+        addEvidence(
+                evidence,
+                "QUESTION_STEM",
+                row.getString("stem"));
+        addEvidence(
+                evidence,
+                "STANDARD_ANSWER",
+                row.getString("standardAnswer"));
+        addEvidence(
+                evidence,
+                "TEACHER_ANALYSIS",
+                row.getString("teacherAnalysis"));
+        addEvidence(
+                evidence,
+                "STATISTICS",
+                row.getInt("wrongCount") + " 人错误");
+        List<String> knowledgeNames = jdbcTemplate.query(
+                """
+                SELECT k.name
+                FROM course_question_kp qk
+                JOIN kp_node k ON k.id = qk.knowledgePointId
+                WHERE qk.questionId = ?
+                ORDER BY k.kpLevel, k.code
+                """,
+                (result, index) -> result.getString("name"),
+                row.getInt("questionId"));
+        if (!knowledgeNames.isEmpty()) {
+            addEvidence(
+                    evidence,
+                    "KNOWLEDGE_POINT",
+                    String.join("、", knowledgeNames));
+        }
+        return List.copyOf(evidence.values());
+    }
+
+    private void addEvidence(
+            Map<String, Map<String, Object>> evidence,
+            String type,
+            String text) {
+        if (isBlank(text)) return;
+        Map<String, Object> item = new LinkedHashMap<>();
+        item.put("evidenceType", type);
+        item.put("snapshotText", text);
+        evidence.putIfAbsent(type + "|" + text, item);
+    }
+
+    private Map<String, Object> teacherDraft(
+            Map<String, Object> draft,
+            List<Map<String, Object>> evidence) {
+        if (draft == null) return null;
+        Map<String, Object> item = new LinkedHashMap<>();
+        item.put("id", draft.get("id"));
+        item.put("homeworkId", null);
+        item.put("questionId", null);
+        item.put("draftType", "QUESTION_COMMENTARY");
+        item.put("content", commentaryText.toReadable(
+                value(draft.get("content"))));
+        item.put("status", draft.get("status"));
+        item.put("model", draft.get("model"));
+        item.put("promptVersion", draft.get("promptVersion"));
+        item.put("generationNo", draft.get("generationNo"));
+        item.put("requestId", null);
+        item.put("elapsedMs", draft.get("elapsedMs"));
+        item.put("errorCode", draft.get("errorCode"));
+        Object createdAt = draft.get("createdAt");
+        item.put("createdAt", createdAt == null ? null : createdAt.toString());
+        item.put("evidence", evidence);
         return item;
     }
 
     private Map<String, Object> itemById(int itemId) {
         return jdbcTemplate.query(
                 """
-                SELECT hi.*, q.seqNo, q.questionType, q.stem, q.options,
+                SELECT hi.*, h.homeworkId, q.seqNo, q.questionType, q.stem, q.options,
                        q.standardAnswer, q.teacherAnalysis, q.score,
                        v.content,
                        (SELECT COUNT(*) FROM handout_item_version viv
@@ -1875,16 +2052,40 @@ public class TeacherPlatformService {
                 questionId);
         String evidence;
         try {
-            evidence = objectMapper.writeValueAsString(List.of(
-                    Map.of(
-                            "evidenceType", "QUESTION_STEM",
-                            "snapshotText", String.valueOf(source.get("stem"))),
-                    Map.of(
-                            "evidenceType", "STANDARD_ANSWER",
-                            "snapshotText", String.valueOf(source.get("standardAnswer"))),
-                    Map.of(
-                            "evidenceType", "STATISTICS",
-                            "snapshotText", source.get("wrongCount") + " 人错误")));
+            List<Map<String, Object>> evidenceItems = new ArrayList<>();
+            addAiEvidence(
+                    evidenceItems,
+                    "QUESTION_STEM",
+                    value(source.get("stem")));
+            addAiEvidence(
+                    evidenceItems,
+                    "STANDARD_ANSWER",
+                    value(source.get("standardAnswer")));
+            addAiEvidence(
+                    evidenceItems,
+                    "TEACHER_ANALYSIS",
+                    value(source.get("teacherAnalysis")));
+            addAiEvidence(
+                    evidenceItems,
+                    "STATISTICS",
+                    source.get("wrongCount") + " 人错误");
+            List<String> knowledgeNames = jdbcTemplate.query(
+                    """
+                    SELECT k.name
+                    FROM course_question_kp qk
+                    JOIN kp_node k ON k.id = qk.knowledgePointId
+                    WHERE qk.questionId = ?
+                    ORDER BY k.kpLevel, k.code
+                    """,
+                    (result, index) -> result.getString("name"),
+                    questionId);
+            if (!knowledgeNames.isEmpty()) {
+                addAiEvidence(
+                        evidenceItems,
+                        "KNOWLEDGE_POINT",
+                        String.join("、", knowledgeNames));
+            }
+            evidence = objectMapper.writeValueAsString(evidenceItems);
         } catch (Exception error) {
             evidence = "[]";
         }
@@ -1915,6 +2116,17 @@ public class TeacherPlatformService {
             return statement;
         }, keyHolder);
         return keyHolder.getKey() == null ? 0 : keyHolder.getKey().intValue();
+    }
+
+    private void addAiEvidence(
+            List<Map<String, Object>> evidence,
+            String type,
+            String text) {
+        if (isBlank(text)) return;
+        Map<String, Object> item = new LinkedHashMap<>();
+        item.put("evidenceType", type);
+        item.put("snapshotText", text);
+        evidence.add(item);
     }
 
     private Map<String, Object> correctionMap(java.sql.ResultSet row)
@@ -2401,6 +2613,19 @@ public class TeacherPlatformService {
         currentHomeworkVersion(teacherId, homeworkId);
     }
 
+    private void requireHomeworkEditable(int teacherId, int homeworkId) {
+        String status = workflowMapper.selectHomeworkStatus(
+                teacherId,
+                homeworkId);
+        if (status == null) throw notFound("作业不存在。");
+        if ("ARCHIVED".equals(status)) {
+            throw new PlatformException(
+                    HttpStatus.CONFLICT,
+                    "HOMEWORK_ARCHIVED",
+                    "作业已归档，不能继续修改题目或批改记录。");
+        }
+    }
+
     private Integer currentBatchId(int homeworkId) {
         return jdbcTemplate.query(
                 """
@@ -2603,6 +2828,23 @@ public class TeacherPlatformService {
 
     private String value(Object value) {
         return value == null ? null : String.valueOf(value);
+    }
+
+    private boolean isBlank(String value) {
+        return value == null
+                || value.isBlank()
+                || "null".equalsIgnoreCase(value.trim());
+    }
+
+    private void requireCommentaryLength(String content) {
+        int length = content.codePointCount(0, content.length());
+        if (length > 2000) {
+            throw new PlatformException(
+                    HttpStatus.UNPROCESSABLE_ENTITY,
+                    "COMMENTARY_TOO_LONG",
+                    "讲评正文最多 2000 个字符。",
+                    Map.of("maxLength", 2000, "actualLength", length));
+        }
     }
 
     private String normalizeQuestionType(String value) {

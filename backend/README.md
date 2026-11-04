@@ -1,6 +1,6 @@
 # Java 后端
 
-Spring Boot 3 + Java 17 + MySQL 8 + Flyway。
+Spring Boot 3 + Java 17 + MyBatis + MySQL 8 + Flyway。
 
 ## 启动
 
@@ -42,6 +42,8 @@ Flyway 迁移位于 `src/main/resources/db/migration`，启动时自动执行。
 - 学生提交快照、逐题答案、总分与错题快照。
 - AI 题目草稿、AI 讲评草稿和教师确认版本。
 - 学生订正、疑问、回复、操作日志和后端事件日志。
+
+关键业务查询（作业状态写保护、AI 依据快照）使用 MyBatis Mapper；复杂统计和批处理继续复用 Spring JDBC。
 
 ## 主要接口
 
