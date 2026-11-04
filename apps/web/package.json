@@ -59,7 +59,7 @@
     "font-awesome": "^4.7.0",
     "fuse.js": "^7.1.0",
     "highlight.js": "^11.9.0",
-    "jsondiffpatch": "^0.7.6",
+    "jsondiffpatch": "^0.7.7",
     "katex": "^0.19.1",
     "lucide-react": "^0.577.0",
     "marked": "^13.0.0",
